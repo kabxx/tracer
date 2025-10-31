@@ -1,6 +1,6 @@
 from typing import Any
 
-from execution.deep_copy import deepcopy
+from tracer.deep_copy import deepcopy
 
 
 def deep_copy(

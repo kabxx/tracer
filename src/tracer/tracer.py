@@ -28,7 +28,7 @@ from typing import (
 
 from abc import abstractmethod, ABC
 
-from execution.utils import (
+from tracer.utils import (
     deep_equal,
     deep_copy,
     V1ReprRegistryHelper,
@@ -175,8 +175,6 @@ class BaseTracer(ABC):
 
         elif event == "return":
             self.set_depth(self.get_depth() - 1)
-
-        print(frame.f_code.co_filename)
 
         # check patterns
         if self._patterns is not None:
