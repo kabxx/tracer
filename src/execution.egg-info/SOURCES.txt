@@ -1,0 +1,9 @@
+pyproject.toml
+src/execution/__init__.py
+src/execution/copy.py
+src/execution/trace.py
+src/execution.egg-info/PKG-INFO
+src/execution.egg-info/SOURCES.txt
+src/execution.egg-info/dependency_links.txt
+src/execution.egg-info/top_level.txt
+tests/test_trace.py
