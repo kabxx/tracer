@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -9,6 +8,9 @@ import time
 import traceback
 import concurrent.futures
 import multiprocessing.pool
+import functools
+import atexit
+import signal
 
 import dill
 import wcmatch.glob
@@ -92,10 +94,13 @@ class TracerThreadContext:
         self._depth = -1
 
 
-_HOOK_PATCHES = {
+_HOOKS_ = {
     "multiprocessing.Process.__init__": multiprocessing.Process.__init__,
+    "multiprocessing.Process.run": multiprocessing.Process.run,
+    "multiprocessing.pool.Pool.__init__": multiprocessing.pool.Pool.__init__,
+    "multiprocessing.pool.Pool.terminate": multiprocessing.pool.Pool.terminate,
     "concurrent.future.ProcessPoolExecutor.submit": concurrent.futures.ProcessPoolExecutor.submit,
-    "multiprocessing.pool.Pool.map": multiprocessing.pool.Pool.map,
+    "concurrent.future.ProcessPoolExecutor.map": concurrent.futures.ProcessPoolExecutor.map,
 }
 
 
@@ -109,6 +114,36 @@ def _tracer_hook_target(
     tracer = ___tracer_cls___(**___tracer_kwargs___)
     with tracer:
         return ___tracer_target___(*args, **kwargs)
+
+
+_TARCER_HOOK_WORKER_INSTANCE: "BaseTracer" = None
+
+
+def _hook_multiprocessing_pool_start(tracer_cls, tracer_kwargs, user_initializer, user_initargs):
+    global _TARCER_HOOK_WORKER_INSTANCE
+
+    
+    if _TARCER_HOOK_WORKER_INSTANCE is None:
+        print("START ")
+        _TARCER_HOOK_WORKER_INSTANCE = tracer_cls(**tracer_kwargs)
+        _TARCER_HOOK_WORKER_INSTANCE.start()
+
+        # atexit.register(_hook_multiprocessing_pool_stop)
+        signal.signal(signal.SIGTERM, _hook_multiprocessing_pool_stop)
+        signal.signal(signal.SIGINT, _hook_multiprocessing_pool_stop)
+
+    if user_initializer:
+        user_initializer(*user_initargs)
+
+
+def _hook_multiprocessing_pool_stop(signal, frame):
+    global _TARCER_HOOK_WORKER_INSTANCE
+
+    print("STOP ")
+
+    if _TARCER_HOOK_WORKER_INSTANCE is not None:
+        _TARCER_HOOK_WORKER_INSTANCE.stop()
+        _TARCER_HOOK_WORKER_INSTANCE = None
 
 
 class BaseTracer(ABC):
@@ -415,9 +450,17 @@ class BaseTracer(ABC):
             *,
             daemon=None,
         ):
+            tracer_cls = self.__class__
+            tracer_kwargs = self._kwargs
 
-            if target is None:
-                return _HOOK_PATCHES["multiprocessing.Process.__init__"](
+            if target is None and p_self.run != _HOOKS_["multiprocessing.Process.run"]:
+                target = p_self.run
+                args = ()
+                kwargs = {}
+                p_self.run = _HOOKS_["multiprocessing.Process.run"]
+
+            elif target is None:
+                return _HOOKS_["multiprocessing.Process.__init__"](
                     p_self,
                     group=group,
                     target=target,
@@ -431,12 +474,12 @@ class BaseTracer(ABC):
             kwargs.update(
                 {
                     "___tracer_target___": target,
-                    "___tracer_cls___": self.__class__,
-                    "___tracer_kwargs___": self._kwargs,
+                    "___tracer_cls___": tracer_cls,
+                    "___tracer_kwargs___": tracer_kwargs,
                 }
             )
 
-            return _HOOK_PATCHES["multiprocessing.Process.__init__"](
+            return _HOOKS_["multiprocessing.Process.__init__"](
                 p_self,
                 group=group,
                 target=_tracer_hook_target,
@@ -444,6 +487,33 @@ class BaseTracer(ABC):
                 args=args,
                 kwargs=kwargs,
                 daemon=daemon,
+            )
+
+        def _multiprocessing_pool_pool_init_(
+            p_self,
+            processes=None,
+            initializer=None,
+            initargs=(),
+            maxtasksperchild=None,
+            context=None,
+        ):
+            tracer_cls = self.__class__
+            tracer_kwargs = self._kwargs
+
+            wrapped_initargs = (
+                tracer_cls,
+                tracer_kwargs,
+                initializer,
+                initargs,
+            )
+
+            return _HOOKS_["multiprocessing.pool.Pool.__init__"](
+                p_self,
+                processes=processes,
+                initializer=_hook_multiprocessing_pool_start,
+                initargs=wrapped_initargs,
+                maxtasksperchild=maxtasksperchild,
+                context=context,
             )
 
         def _concurrent_future_processpoolexecutor_submit_(
@@ -462,33 +532,32 @@ class BaseTracer(ABC):
                 }
             )
 
-            return _HOOK_PATCHES["concurrent.future.ProcessPoolExecutor.submit"](
+            return _HOOKS_["concurrent.future.ProcessPoolExecutor.submit"](
                 p_self,
                 _tracer_hook_target,
                 *args,
                 **kwargs,
             )
 
-        def _multiprocessing_pool_pool_map_(
+        def _concurrent_future_processpoolexecutor_map_(
             p_self,
-            func: Callable,
-            iterable,
-            chunksize: Optional[int] = None,
+            fn: Callable,
+            *iterables,
+            timeout=None,
+            chunksize=1,
         ):
+            wrapped_func = functools.partial(
+                _tracer_hook_target,
+                ___tracer_target___=fn,
+                ___tracer_cls___=self.__class__,
+                ___tracer_kwargs___=self._kwargs,
+            )
 
-            def wrapped_func(*args, **kwargs):
-                return _tracer_hook_target(
-                    *args,
-                    ___tracer_target___=func,
-                    ___tracer_cls___=self.__class__,
-                    ___tracer_kwargs___=self._kwargs,
-                    **kwargs,
-                )
-
-            return _HOOK_PATCHES["multiprocessing.pool.Pool.map"](
+            return _HOOKS_["concurrent.future.ProcessPoolExecutor.map"](
                 p_self,
                 wrapped_func,
-                iterable,
+                *iterables,
+                timeout=timeout,
                 chunksize=chunksize,
             )
 
@@ -498,35 +567,47 @@ class BaseTracer(ABC):
             _multiprocessing_process_init_,
         )
         setattr(
+            multiprocessing.pool.Pool,
+            "__init__",
+            _multiprocessing_pool_pool_init_,
+        )
+        setattr(
             concurrent.futures.ProcessPoolExecutor,
             "submit",
             _concurrent_future_processpoolexecutor_submit_,
         )
         setattr(
-            multiprocessing.pool.Pool,
+            concurrent.futures.ProcessPoolExecutor,
             "map",
-            _multiprocessing_pool_pool_map_,
+            _concurrent_future_processpoolexecutor_map_,
         )
 
     def _stop_hook(
         self,
     ) -> None:
+
         if self._only_main_process:
             return
+
         setattr(
             multiprocessing.Process,
             "__init__",
-            _HOOK_PATCHES["multiprocessing.Process.__init__"],
+            _HOOKS_["multiprocessing.Process.__init__"],
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "__init__",
+            _HOOKS_["multiprocessing.pool.Pool.__init__"],
         )
         setattr(
             concurrent.futures.ProcessPoolExecutor,
             "submit",
-            _HOOK_PATCHES["concurrent.future.ProcessPoolExecutor.submit"],
+            _HOOKS_["concurrent.future.ProcessPoolExecutor.submit"],
         )
         setattr(
-            multiprocessing.pool.Pool,
+            concurrent.futures.ProcessPoolExecutor,
             "map",
-            _HOOK_PATCHES["multiprocessing.pool.Pool.map"],
+            _HOOKS_["concurrent.future.ProcessPoolExecutor.map"],
         )
 
     def _stop_save(
@@ -544,14 +625,14 @@ class BaseTracer(ABC):
 
     def start(self):
         if self._is_started:
-            raise RuntimeError(f"{self.__class__.__name__} has already started")
+            return
         self._is_started = True
         self._start_trace()
         self._start_hook()
 
     def stop(self):
         if not self._is_started:
-            raise RuntimeError(f"{self.__class__.__name__} has already stopped")
+            return
         self._is_started = False
         self._stop_trace()
         self._stop_hook()
@@ -559,6 +640,7 @@ class BaseTracer(ABC):
 
     def __enter__(self):
         self.start()
+        return self
 
     def __exit__(
         self,
@@ -566,6 +648,7 @@ class BaseTracer(ABC):
         exc_value: BaseException,
         traceback: TracebackType,
     ):
+        print("stop")
         self.stop()
 
     @abstractmethod
@@ -629,6 +712,35 @@ class BaseTracer(ABC):
         snapshot: Dict[str, Any],
         variables: Dict[str, Any],
     ) -> Dict[str, Any]: ...
+
+
+class _UncopyableVariableWrapper:
+    def __init__(
+        self,
+        var: Any,
+    ):
+        cls = type(var)
+        try:
+            self._cls_module = cls.__module__
+        except:
+            self._cls_module = "[unknown_class_module]"
+        try:
+            self._cls_type = cls.__name__
+        except:
+            self._cls_type = "[unknown_class_name]"
+
+    def __eq__(
+        self,
+        value,
+    ):
+        return (
+            self._cls_module == value._cls_module and self._cls_type == value._cls_type
+        )
+
+    def __repr__(
+        self,
+    ):
+        return "<unresolvable {}.{} object>".format(self._cls_module, self._cls_type)
 
 
 class _V1ReprTracer(BaseTracer):
@@ -740,28 +852,28 @@ class _V2ReprTracer(BaseTracer):
         self,
         variable: Any,
     ) -> Any:
-        return self.helper().repr(variable)
+        return self.repr(variable)
 
     @override
     def _serialize_function_return_value(
         self,
         function_return_value: Any,
     ) -> str:
-        return self.helper().repr(function_return_value)
+        return self.repr(function_return_value)
 
     @override
     def _serialize_exception_type(
         self,
         exception_type: Type[BaseException],
     ) -> Any:
-        return self.helper().repr(exception_type)
+        return self.repr(exception_type)
 
     @override
     def _serialize_exception_value(
         self,
         exception_value: BaseException,
     ) -> Any:
-        return self.helper().repr(exception_value)
+        return self.repr(exception_value)
 
     @override
     def _serialize_exception_traceback(
@@ -813,6 +925,7 @@ class _V2ReprTracer(BaseTracer):
 
 
 class _V3ReprTracer(BaseTracer):
+
     def __init__(
         self,
         dest_dir: _StrOrPath,
@@ -841,6 +954,15 @@ class _V3ReprTracer(BaseTracer):
 
         self._helper = RichReprRegistryHelper()
 
+    def repr(
+        self,
+        var: Any,
+    ) -> str:
+        if isinstance(var, _UncopyableVariableWrapper):
+            return repr(var)
+        else:
+            return self._helper.repr(var)
+
     def helper(
         self,
     ) -> V1ReprRegistryHelper:
@@ -851,28 +973,28 @@ class _V3ReprTracer(BaseTracer):
         self,
         variable: Any,
     ) -> Any:
-        return self.helper().repr(variable)
+        return self.repr(variable)
 
     @override
     def _serialize_function_return_value(
         self,
         function_return_value: Any,
     ) -> str:
-        return self.helper().repr(function_return_value)
+        return self.repr(function_return_value)
 
     @override
     def _serialize_exception_type(
         self,
         exception_type: Type[BaseException],
     ) -> Any:
-        return self.helper().repr(exception_type)
+        return self.repr(exception_type)
 
     @override
     def _serialize_exception_value(
         self,
         exception_value: BaseException,
     ) -> Any:
-        return self.helper().repr(exception_value)
+        return self.repr(exception_value)
 
     @override
     def _serialize_exception_traceback(
@@ -888,12 +1010,9 @@ class _V3ReprTracer(BaseTracer):
         v2: Any,
     ) -> bool:
         try:
-            ret = dill.dumps(v1) == dill.dumps(v2)
+            return dill.dumps(v1) == dill.dumps(v2)
         except:
-            ret = False
-        if ret:
-            return ret
-        return self.helper().repr(v1) == self.helper().repr(v2)
+            return self.repr(v1) == self.repr(v2)
 
     @override
     def _copy_variable(
@@ -903,16 +1022,7 @@ class _V3ReprTracer(BaseTracer):
         try:
             return dill.loads(dill.dumps(variable))
         except:
-            cls = type(variable)
-            try:
-                cls_name = cls.__name__
-            except:
-                cls_name = "[unknown_class_name]"
-            try:
-                cls_module = cls.__module__
-            except:
-                cls_module = "[unknown_class_module]"
-            return f"<uncopyable {cls_module}.{cls_name} object>"
+            return _UncopyableVariableWrapper(variable)
 
     @override
     def _diff_variables(
