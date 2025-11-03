@@ -97,10 +97,12 @@ class TracerThreadContext:
 _HOOKS_ = {
     "multiprocessing.Process.__init__": multiprocessing.Process.__init__,
     "multiprocessing.Process.run": multiprocessing.Process.run,
-    "multiprocessing.pool.Pool.__init__": multiprocessing.pool.Pool.__init__,
-    "multiprocessing.pool.Pool.terminate": multiprocessing.pool.Pool.terminate,
     "concurrent.future.ProcessPoolExecutor.submit": concurrent.futures.ProcessPoolExecutor.submit,
     "concurrent.future.ProcessPoolExecutor.map": concurrent.futures.ProcessPoolExecutor.map,
+    "multiprocessing.pool.Pool._map_async": multiprocessing.pool.Pool._map_async,
+    "multiprocessing.pool.Pool.apply_async": multiprocessing.pool.Pool.apply_async,
+    "multiprocessing.pool.Pool.imap": multiprocessing.pool.Pool.imap,
+    "multiprocessing.pool.Pool.imap_unordered": multiprocessing.pool.Pool.imap_unordered,
 }
 
 
@@ -114,36 +116,6 @@ def _tracer_hook_target(
     tracer = ___tracer_cls___(**___tracer_kwargs___)
     with tracer:
         return ___tracer_target___(*args, **kwargs)
-
-
-_TARCER_HOOK_WORKER_INSTANCE: "BaseTracer" = None
-
-
-def _hook_multiprocessing_pool_start(tracer_cls, tracer_kwargs, user_initializer, user_initargs):
-    global _TARCER_HOOK_WORKER_INSTANCE
-
-    
-    if _TARCER_HOOK_WORKER_INSTANCE is None:
-        print("START ")
-        _TARCER_HOOK_WORKER_INSTANCE = tracer_cls(**tracer_kwargs)
-        _TARCER_HOOK_WORKER_INSTANCE.start()
-
-        # atexit.register(_hook_multiprocessing_pool_stop)
-        signal.signal(signal.SIGTERM, _hook_multiprocessing_pool_stop)
-        signal.signal(signal.SIGINT, _hook_multiprocessing_pool_stop)
-
-    if user_initializer:
-        user_initializer(*user_initargs)
-
-
-def _hook_multiprocessing_pool_stop(signal, frame):
-    global _TARCER_HOOK_WORKER_INSTANCE
-
-    print("STOP ")
-
-    if _TARCER_HOOK_WORKER_INSTANCE is not None:
-        _TARCER_HOOK_WORKER_INSTANCE.stop()
-        _TARCER_HOOK_WORKER_INSTANCE = None
 
 
 class BaseTracer(ABC):
@@ -489,33 +461,6 @@ class BaseTracer(ABC):
                 daemon=daemon,
             )
 
-        def _multiprocessing_pool_pool_init_(
-            p_self,
-            processes=None,
-            initializer=None,
-            initargs=(),
-            maxtasksperchild=None,
-            context=None,
-        ):
-            tracer_cls = self.__class__
-            tracer_kwargs = self._kwargs
-
-            wrapped_initargs = (
-                tracer_cls,
-                tracer_kwargs,
-                initializer,
-                initargs,
-            )
-
-            return _HOOKS_["multiprocessing.pool.Pool.__init__"](
-                p_self,
-                processes=processes,
-                initializer=_hook_multiprocessing_pool_start,
-                initargs=wrapped_initargs,
-                maxtasksperchild=maxtasksperchild,
-                context=context,
-            )
-
         def _concurrent_future_processpoolexecutor_submit_(
             p_self,
             fn: Callable,
@@ -523,18 +468,16 @@ class BaseTracer(ABC):
             **kwargs,
         ) -> concurrent.futures.Future:
 
-            kwargs = kwargs.copy()
-            kwargs.update(
-                {
-                    "___tracer_target___": fn,
-                    "___tracer_cls___": self.__class__,
-                    "___tracer_kwargs___": self._kwargs,
-                }
+            wrapped_func = functools.partial(
+                _tracer_hook_target,
+                ___tracer_target___=fn,
+                ___tracer_cls___=self.__class__,
+                ___tracer_kwargs___=self._kwargs,
             )
 
             return _HOOKS_["concurrent.future.ProcessPoolExecutor.submit"](
                 p_self,
-                _tracer_hook_target,
+                wrapped_func,
                 *args,
                 **kwargs,
             )
@@ -561,15 +504,100 @@ class BaseTracer(ABC):
                 chunksize=chunksize,
             )
 
+        def _multiprocessing_pool_pool_map_async_(
+            p_self,
+            func: Callable,
+            iterable,
+            mapper,
+            chunksize=None,
+            callback=None,
+            error_callback=None,
+        ):
+            wrapped_func = functools.partial(
+                _tracer_hook_target,
+                ___tracer_target___=func,
+                ___tracer_cls___=self.__class__,
+                ___tracer_kwargs___=self._kwargs,
+            )
+
+            return _HOOKS_["multiprocessing.pool.Pool._map_async"](
+                p_self,
+                wrapped_func,
+                iterable,
+                mapper,
+                chunksize=chunksize,
+                callback=callback,
+                error_callback=error_callback,
+            )
+
+        def _multiprocessing_pool_pool_apply_async_(
+            p_self,
+            func,
+            args=(),
+            kwds={},
+            callback=None,
+            error_callback=None,
+        ):
+            wrapped_func = functools.partial(
+                _tracer_hook_target,
+                ___tracer_target___=func,
+                ___tracer_cls___=self.__class__,
+                ___tracer_kwargs___=self._kwargs,
+            )
+
+            return _HOOKS_["multiprocessing.pool.Pool.apply_async"](
+                p_self,
+                wrapped_func,
+                args=args,
+                kwds=kwds,
+                callback=callback,
+                error_callback=error_callback,
+            )
+
+        def _multiprocessing_pool_pool_imap_(
+            p_self,
+            func,
+            iterable,
+            chunksize=1,
+        ):
+            wrapped_func = functools.partial(
+                _tracer_hook_target,
+                ___tracer_target___=func,
+                ___tracer_cls___=self.__class__,
+                ___tracer_kwargs___=self._kwargs,
+            )
+
+            return _HOOKS_["multiprocessing.pool.Pool.imap"](
+                p_self,
+                wrapped_func,
+                iterable,
+                chunksize=chunksize,
+            )
+        
+        def _multiprocessing_pool_pool_imap_unordered_(
+            p_self,
+            func,
+            iterable,
+            chunksize=1,
+        ):
+            wrapped_func = functools.partial(
+                _tracer_hook_target,
+                ___tracer_target___=func,
+                ___tracer_cls___=self.__class__,
+                ___tracer_kwargs___=self._kwargs,
+            )
+
+            return _HOOKS_["multiprocessing.pool.Pool.imap_unordered"](
+                p_self,
+                wrapped_func,
+                iterable,
+                chunksize=chunksize,
+            )
+
         setattr(
             multiprocessing.Process,
             "__init__",
             _multiprocessing_process_init_,
-        )
-        setattr(
-            multiprocessing.pool.Pool,
-            "__init__",
-            _multiprocessing_pool_pool_init_,
         )
         setattr(
             concurrent.futures.ProcessPoolExecutor,
@@ -580,6 +608,26 @@ class BaseTracer(ABC):
             concurrent.futures.ProcessPoolExecutor,
             "map",
             _concurrent_future_processpoolexecutor_map_,
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "_map_async",
+            _multiprocessing_pool_pool_map_async_,
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "apply_async",
+            _multiprocessing_pool_pool_apply_async_,
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "imap",
+            _multiprocessing_pool_pool_imap_,
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "imap_unordered",
+            _multiprocessing_pool_pool_imap_unordered_,
         )
 
     def _stop_hook(
@@ -595,11 +643,6 @@ class BaseTracer(ABC):
             _HOOKS_["multiprocessing.Process.__init__"],
         )
         setattr(
-            multiprocessing.pool.Pool,
-            "__init__",
-            _HOOKS_["multiprocessing.pool.Pool.__init__"],
-        )
-        setattr(
             concurrent.futures.ProcessPoolExecutor,
             "submit",
             _HOOKS_["concurrent.future.ProcessPoolExecutor.submit"],
@@ -608,6 +651,26 @@ class BaseTracer(ABC):
             concurrent.futures.ProcessPoolExecutor,
             "map",
             _HOOKS_["concurrent.future.ProcessPoolExecutor.map"],
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "_map_async",
+            _HOOKS_["multiprocessing.pool.Pool._map_async"],
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "apply_async",
+            _HOOKS_["multiprocessing.pool.Pool.apply_async"],
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "imap",
+            _HOOKS_["multiprocessing.pool.Pool.imap"],
+        )
+        setattr(
+            multiprocessing.pool.Pool,
+            "imap_unordered",
+            _HOOKS_["multiprocessing.pool.Pool.imap_unordered"],
         )
 
     def _stop_save(
@@ -648,7 +711,6 @@ class BaseTracer(ABC):
         exc_value: BaseException,
         traceback: TracebackType,
     ):
-        print("stop")
         self.stop()
 
     @abstractmethod
