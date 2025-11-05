@@ -27,10 +27,7 @@ from enum import Enum
 from abc import abstractmethod, ABC
 
 from tracer.utils import (
-    deep_equal,
-    deep_copy,
     V1ReprRegistryHelper,
-    safe_repr,
     RichReprRegistryHelper,
     ReprWrapperClass,
     HookContext,
@@ -103,7 +100,8 @@ class BaseTracer(ABC):
     def __init__(
         self,
         dest_dir: _StrOrPath,
-        patterns: Optional[List[_StrOrPath]] = None,
+        includes: Optional[List[_StrOrPath]] = None,
+        excludes: Optional[List[_StrOrPath]] = None,
         trace_locals: bool = True,
         trace_globals: bool = False,
         only_trace_changed_locals: bool = True,
@@ -111,7 +109,7 @@ class BaseTracer(ABC):
         skip_empty_trace: bool = True,
         only_main_thread: bool = False,
         skip_empty_thread: bool = True,
-        only_main_process: bool = True,
+        only_main_process: bool = False,
     ):
         kwargs = locals()
         kwargs.pop("self")
@@ -123,9 +121,14 @@ class BaseTracer(ABC):
         if self._dest_dir.exists() and not self._dest_dir.is_dir():
             raise ValueError(f"Destination {dest_dir} is not a directory.")
 
-        self._patterns = (
-            [wcmatch.glob.compile(p, flags=wcmatch.glob.GLOBSTARLONG) for p in patterns]
-            if patterns
+        self._includes = (
+            [wcmatch.glob.compile(p, flags=wcmatch.glob.GLOBSTARLONG) for p in includes]
+            if includes
+            else None
+        )
+        self._excludes = (
+            [wcmatch.glob.compile(p, flags=wcmatch.glob.GLOBSTARLONG) for p in excludes]
+            if excludes
             else None
         )
 
@@ -135,13 +138,15 @@ class BaseTracer(ABC):
         self._only_trace_changed_globals = only_trace_changed_globals
         self._skip_empty_trace = skip_empty_trace
 
+        # trace thread
         self._only_main_thread = only_main_thread
         self._skip_empty_thread = skip_empty_thread
-
-        self._only_main_process = only_main_process
-
         self._thread_contexts: Dict[threading.Thread, TracerThreadContext] = {}
 
+        # trace process
+        self._only_main_process = only_main_process
+
+        # hook
         self._hook_context: HookContext = HookContext()
 
     def __trace__(
@@ -150,6 +155,8 @@ class BaseTracer(ABC):
         event: str,
         arg: Any,
     ) -> Optional[Callable[[FrameType, str, Any], Any]]:
+        
+        print(f"TRACE {os.getpid()} {threading.current_thread().name} {event} {frame.f_code.co_name} {frame.f_lineno} {frame.f_code.co_filename}")
 
         # update depth
         if event == "call":
@@ -159,9 +166,14 @@ class BaseTracer(ABC):
             self._set_current_thread_depth(self._get_current_thread_depth() - 1)
 
         # check patterns
-        if self._patterns is not None:
+        if self._includes is not None:
             if not any(
-                pattern.match(frame.f_code.co_filename) for pattern in self._patterns
+                pattern.match(frame.f_code.co_filename) for pattern in self._includes
+            ):
+                return self.__trace__
+        if self._excludes is not None:
+            if any(
+                pattern.match(frame.f_code.co_filename) for pattern in self._excludes
             ):
                 return self.__trace__
 
@@ -485,7 +497,9 @@ class BaseTracer(ABC):
                 ) as f:
                     json.dump(trace, f, indent=4)
 
-    def start(self):
+    def start(
+        self,
+    ):
         if self._status == BaseTracer.Status.STOPPED:
             raise RuntimeError("Tracer has been stopped and cannot be restarted.")
         if self._status == BaseTracer.Status.STARTED:
@@ -495,7 +509,9 @@ class BaseTracer(ABC):
         self._start_hook()
         self._status = BaseTracer.Status.STARTED
 
-    def stop(self):
+    def stop(
+        self,
+    ):
         if self._status == BaseTracer.Status.INIT:
             raise RuntimeError("Tracer has not been started.")
         if self._status == BaseTracer.Status.STOPPED:
@@ -506,7 +522,9 @@ class BaseTracer(ABC):
         self._stop_save()
         self._status = BaseTracer.Status.STOPPED
 
-    def __enter__(self):
+    def __enter__(
+        self,
+    ):
         self.start()
         return self
 
@@ -539,6 +557,7 @@ class BaseTracer(ABC):
                         del function["__global_snapshot__"]
 
                 value._stacks[-1]["traces"][-1]["functions"].append(function)
+            # repair broken stacks end
 
             value = value._stacks[0]["traces"][0]["functions"]
             if self._skip_empty_thread and not value:
@@ -609,193 +628,13 @@ class BaseTracer(ABC):
     ) -> Dict[str, Any]: ...
 
 
-class _V1ReprTracer(BaseTracer):
-
-    @override
-    def _serialize_variable(
-        self,
-        variable: Any,
-    ) -> Any:
-        return safe_repr(variable)
-
-    @override
-    def _serialize_function_return_value(
-        self,
-        function_return_value: Any,
-    ) -> str:
-        return safe_repr(function_return_value)
-
-    @override
-    def _serialize_exception_type(
-        self,
-        exception_type: Type[BaseException],
-    ) -> Any:
-        return safe_repr(exception_type)
-
-    @override
-    def _serialize_exception_value(
-        self,
-        exception_value: BaseException,
-    ) -> Any:
-        return safe_repr(exception_value)
-
-    @override
-    def _serialize_exception_traceback(
-        self,
-        exception_traceback: TracebackType,
-    ) -> Any:
-        return "\n".join(traceback.format_tb(exception_traceback))
-
-    @override
-    def _compare_variable(
-        self,
-        v1: Any,
-        v2: Any,
-    ) -> bool:
-        return deep_equal(v1, v2)
-
-    @override
-    def _copy_variable(
-        self,
-        variable: Any,
-    ) -> Any:
-        try:
-            return deep_copy(variable)
-        except:
-            return safe_repr(variable)
-
-    @override
-    def _diff_variables(
-        self,
-        snapshot: Dict[str, Any],
-        variables: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        return self._copy_variables(
-            {
-                k: v
-                for k, v in variables.items()
-                if k not in snapshot or not self._compare_variable(snapshot[k], v)
-            }
-        )
-
-
-class _V2ReprTracer(BaseTracer):
-    def __init__(
-        self,
-        dest_dir: _StrOrPath,
-        patterns: Optional[List[_StrOrPath]] = None,
-        trace_locals: bool = True,
-        trace_globals: bool = False,
-        only_trace_changed_locals: bool = True,
-        only_trace_changed_globals: bool = True,
-        skip_empty_trace: bool = True,
-        only_main_thread: bool = False,
-        skip_empty_thread: bool = True,
-        only_main_process: bool = False,
-    ):
-        super().__init__(
-            dest_dir=dest_dir,
-            patterns=patterns,
-            trace_locals=trace_locals,
-            trace_globals=trace_globals,
-            only_trace_changed_locals=only_trace_changed_locals,
-            only_trace_changed_globals=only_trace_changed_globals,
-            skip_empty_trace=skip_empty_trace,
-            only_main_thread=only_main_thread,
-            skip_empty_thread=skip_empty_thread,
-            only_main_process=only_main_process,
-        )
-
-        self._helper = RichReprRegistryHelper()
-
-    def helper(
-        self,
-    ) -> V1ReprRegistryHelper:
-        return self._helper
-
-    @override
-    def _serialize_variable(
-        self,
-        variable: Any,
-    ) -> Any:
-        return self.repr(variable)
-
-    @override
-    def _serialize_function_return_value(
-        self,
-        function_return_value: Any,
-    ) -> str:
-        return self.repr(function_return_value)
-
-    @override
-    def _serialize_exception_type(
-        self,
-        exception_type: Type[BaseException],
-    ) -> Any:
-        return self.repr(exception_type)
-
-    @override
-    def _serialize_exception_value(
-        self,
-        exception_value: BaseException,
-    ) -> Any:
-        return self.repr(exception_value)
-
-    @override
-    def _serialize_exception_traceback(
-        self,
-        exception_traceback: TracebackType,
-    ) -> Any:
-        return "\n".join(traceback.format_tb(exception_traceback))
-
-    @override
-    def _compare_variable(
-        self,
-        v1: Any,
-        v2: Any,
-    ) -> bool:
-        return deep_equal(v1, v2)
-
-    @override
-    def _copy_variable(
-        self,
-        variable: Any,
-    ) -> Any:
-        try:
-            return deep_copy(variable)
-        except:
-            cls = type(variable)
-            try:
-                cls_name = cls.__name__
-            except:
-                cls_name = "[unknown_class_name]"
-            try:
-                cls_module = cls.__module__
-            except:
-                cls_module = "[unknown_class_module]"
-            return f"<uncopyable {cls_module}.{cls_name} object>"
-
-    @override
-    def _diff_variables(
-        self,
-        snapshot: Dict[str, Any],
-        variables: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        return self._copy_variables(
-            {
-                k: v
-                for k, v in variables.items()
-                if k not in snapshot or not self._compare_variable(snapshot[k], v)
-            }
-        )
-
-
 class _V3ReprTracer(BaseTracer):
 
     def __init__(
         self,
         dest_dir: _StrOrPath,
-        patterns: Optional[List[_StrOrPath]] = None,
+        includes: Optional[List[_StrOrPath]] = None,
+        excludes: Optional[List[_StrOrPath]] = None,
         trace_locals: bool = True,
         trace_globals: bool = False,
         only_trace_changed_locals: bool = True,
@@ -807,7 +646,7 @@ class _V3ReprTracer(BaseTracer):
     ):
         super().__init__(
             dest_dir=dest_dir,
-            patterns=patterns,
+            includes=includes,
             trace_locals=trace_locals,
             trace_globals=trace_globals,
             only_trace_changed_locals=only_trace_changed_locals,
