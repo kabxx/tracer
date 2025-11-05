@@ -463,6 +463,10 @@ class RichReprRegistryHelper(AbstractReprRegistryHelper):
         obj: Any,
         max_depth: int = 3,
     ) -> str:
+
+        if obj is None:
+            return "None"
+
         cls = type(obj)
 
         if helper := self.helper(obj):
