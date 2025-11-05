@@ -1,5 +1,6 @@
 wcmatch
 dill
+joblib
 numpy
 rich
 pytest

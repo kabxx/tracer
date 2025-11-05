@@ -55,7 +55,7 @@ def safe_repr(
         return repr(val)
     except Exception as e:
         return (
-            f"<unrepresentable value of type {type(val).__name__} caused by {str(e)}>"
+            f"<unrepresentable object {type(val).__name__} of {str(e)}>"
         )
 
 
@@ -65,7 +65,7 @@ def safe_str(
     try:
         return str(val)
     except Exception as e:
-        return f"<unstringable value of type {type(val).__name__} caused by {str(e)}>"
+        return f"<unstringable object {type(val).__name__} of {str(e)}>"
 
 
 class AbstractReprHelper(ABC):

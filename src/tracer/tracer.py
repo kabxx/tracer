@@ -169,7 +169,7 @@ class BaseTracer(ABC):
             ):
                 return self.trace
 
-        if event == "call":
+        if event == "call" and False:
             print(
                 f"TRACE CALL {frame.f_code.co_name} IN {frame.f_code.co_filename} AT LINE {frame.f_lineno} THREAD {os.getpid()}-{threading.current_thread().name} TIME {time.time()}"
             )  # DEBUG
@@ -542,6 +542,16 @@ class BaseTracer(ABC):
                     if self._only_trace_changed_globals:
                         del function["__global_snapshot__"]
 
+                if not value._stacks[-1]["traces"]:
+                    value._stacks[-1]["traces"].append(
+                        {
+                            "line": "<unknown line>",
+                            "locals": "<unknown locals>",
+                            "functions": [],
+                            "exceptions": [],
+                        }
+                    )
+
                 value._stacks[-1]["traces"][-1]["functions"].append(function)
             # repair broken stacks end
 
@@ -623,7 +633,7 @@ class _V3ReprTracer(BaseTracer):
         only_main_thread: bool = False,
         skip_empty_thread: bool = True,
         only_main_process: bool = False,
-        seralizer_backend: Literal["pickle", "dill"] = "pickle",
+        seralizer_backend: Literal["pickle", "dill", "joblib"] = "pickle",
     ):
         super().__init__(
             dest_dir=dest_dir,
@@ -645,19 +655,34 @@ class _V3ReprTracer(BaseTracer):
             backend=seralizer_backend,
         )
 
+    class SnapShotVariable:
+        def __init__(
+            self,
+            bytes: bytes,
+            repr: str,
+        ):
+            self._bytes = bytes
+            self._repr = repr
+
+        def __bytes__(self):
+            return self._bytes
+
+        def __repr__(self):
+            return self._repr
+
     def repr(
         self,
         var: Any,
     ) -> str:
         return self._helper.repr(var)
 
-    def dumps(
+    def serialize(
         self,
         var: Any,
     ) -> bytes:
         return self._serializer.dumps(var)
 
-    def loads(
+    def deserialize(
         self,
         data: bytes,
     ) -> Any:
@@ -672,54 +697,69 @@ class _V3ReprTracer(BaseTracer):
     def _output_by_exc_type(
         self,
         exception_type: Type[BaseException],
-    ) -> Any:
+    ) -> str:
         return self.repr(exception_type)
 
     @override
     def _output_by_exc_val(
         self,
         exception_value: BaseException,
-    ) -> Any:
+    ) -> str:
         return self.repr(exception_value)
 
     @override
     def _output_by_exc_traceback(
         self,
         exception_traceback: TracebackType,
-    ) -> Any:
+    ) -> str:
         return "\n".join(traceback.format_tb(exception_traceback))
 
     @override
     def _snapshot_variable(
         self,
         variable: Any,
-    ) -> bytes:
+    ) -> SnapShotVariable:
+        # try:
+        #     return self.serialize(variable)
+        # except:
+        #     return self.serialize(ReprWrapperClass(variable))
         try:
-            return self.dumps(variable)
+            return self.SnapShotVariable(
+                bytes=self.serialize(variable),
+                repr=self.repr(variable),
+            )
         except:
-            return self.dumps(ReprWrapperClass(variable))
+            return self.SnapShotVariable(
+                bytes=self.serialize(ReprWrapperClass(variable)),
+                repr=self.repr(variable),
+            )
 
     @override
     def _output_from_snapshot_variable(
         self,
-        variable: bytes,
-    ) -> Any:
-        return self.repr(self.loads(variable))
+        variable: SnapShotVariable,
+    ) -> str:
+        # return self.repr(self.deserialize(variable))
+        return repr(variable)
 
     @override
     def _compare_snapshot_variable(
         self,
-        v1: bytes,
-        v2: bytes,
+        v1: SnapShotVariable,
+        v2: SnapShotVariable,
     ) -> bool:
-        return v1 == v2
+        # return v1 == v2
+        try:
+            return bytes(v1) == bytes(v2)
+        except:
+            return repr(v1) == repr(v2)
 
     @override
     def _diff_snapshot_variables(
         self,
-        snapshot: Dict[str, bytes],
-        variables: Dict[str, bytes],
-    ) -> Dict[str, bytes]:
+        snapshot: Dict[str, SnapShotVariable],
+        variables: Dict[str, SnapShotVariable],
+    ) -> Dict[str, SnapShotVariable]:
         return {
             k: v
             for k, v in variables.items()
