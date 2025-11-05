@@ -3,7 +3,11 @@ import os
 from pathlib import Path
 import sys
 import threading
+import multiprocessing
+import time
 import traceback
+import concurrent.futures
+import multiprocessing.pool
 import functools
 import signal
 
@@ -23,7 +27,6 @@ from typing import (
     override,
 )
 
-from enum import Enum
 from abc import abstractmethod, ABC
 
 from tracer.utils import (
@@ -92,14 +95,104 @@ class TracerThreadContext:
         self._depth = -1
 
 
+_HOOKS_ = {
+    "multiprocessing.Process.__init__": multiprocessing.Process.__init__,
+    "multiprocessing.Process.run": multiprocessing.Process.run,
+    "concurrent.future.ProcessPoolExecutor.submit": concurrent.futures.ProcessPoolExecutor.submit,
+    "concurrent.future.ProcessPoolExecutor.map": concurrent.futures.ProcessPoolExecutor.map,
+    "multiprocessing.pool.Pool._map_async": multiprocessing.pool.Pool._map_async,
+    "multiprocessing.pool.Pool.apply_async": multiprocessing.pool.Pool.apply_async,
+    "multiprocessing.pool.Pool.imap": multiprocessing.pool.Pool.imap,
+    "multiprocessing.pool.Pool.imap_unordered": multiprocessing.pool.Pool.imap_unordered,
+    "multiprocessing.pool.Pool.__init__": multiprocessing.pool.Pool.__init__,
+}
+
+
+def _tracer_hook_target(
+    *args,
+    ___tracer_target___,
+    ___tracer_cls___,
+    ___tracer_kwargs___,
+    **kwargs,
+):
+    tracer = ___tracer_cls___(**___tracer_kwargs___)
+    with tracer:
+        return ___tracer_target___(*args, **kwargs)
+
+
+_TRACER_HOOK_WORKER_INSTANCE: Optional["BaseTracer"] = None
+
+
+def _tracer_hook_worker_stop(
+    signum,
+    frame,
+):
+    global _TRACER_HOOK_WORKER_INSTANCE
+
+    if _TRACER_HOOK_WORKER_INSTANCE is not None:
+        _TRACER_HOOK_WORKER_INSTANCE.stop()
+        _TRACER_HOOK_WORKER_INSTANCE = None
+
+    os._exit(0)
+
+
+def _tracer_hook_process_worker(
+    *args,
+    ___tracer_target___,
+    ___tracer_cls___,
+    ___tracer_kwargs___,
+    **kwargs,
+):
+    tracer = ___tracer_cls___(
+        **___tracer_kwargs___,
+    )
+
+    def _signal_handler(
+        signum,
+        frame,
+        tracer,
+    ):
+        tracer.stop()
+        os._exit(0)
+
+    signal_handler = functools.partial(
+        _signal_handler,
+        tracer=tracer,
+    )
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    tracer.start()
+    try:
+        return ___tracer_target___(*args, **kwargs)
+    finally:
+        tracer.stop()
+
+
+def _tracer_hook_worker_start(
+    ___tracer_target___,
+    ___tracer_cls___,
+    ___tracer_kwargs___,
+    *args,
+    **kwargs,
+):
+    global _TRACER_HOOK_WORKER_INSTANCE
+
+    if _TRACER_HOOK_WORKER_INSTANCE is None:
+        _TRACER_HOOK_WORKER_INSTANCE = ___tracer_cls___(**___tracer_kwargs___)
+        _TRACER_HOOK_WORKER_INSTANCE.start()
+
+    signal.signal(signal.SIGTERM, _tracer_hook_worker_stop)
+    signal.signal(signal.SIGINT, _tracer_hook_worker_stop)
+
+    try:
+        return ___tracer_target___(*args, **kwargs)
+    finally:
+        _tracer_hook_worker_stop(None, None)
+
+
 class BaseTracer(ABC):
-
-    class Status(Enum):
-        UNKNOWN = -1
-        INIT = 0
-        STARTED = 1
-        STOPPED = 2
-
     def __init__(
         self,
         dest_dir: _StrOrPath,
@@ -117,7 +210,7 @@ class BaseTracer(ABC):
         kwargs.pop("self")
         self._kwargs = kwargs.copy()
 
-        self._status: BaseTracer.Status = BaseTracer.Status.INIT
+        self._is_started = False
 
         self._dest_dir = Path(dest_dir)
         if self._dest_dir.exists() and not self._dest_dir.is_dir():
@@ -379,89 +472,272 @@ class BaseTracer(ABC):
         if self._only_main_process:
             return
 
-        def _hook(
-            *args,
-            ___tracer_target___,
-            ___tracer_cls___,
-            ___tracer_kwargs___,
-            **kwargs,
-        ):
-            print(f"PROCESS {os.getpid()} START")
+        # def _multiprocessing_process_init_(
+        #     p_self,
+        #     group=None,
+        #     target=None,
+        #     name=None,
+        #     args=(),
+        #     kwargs={},
+        #     *,
+        #     daemon=None,
+        # ):
 
-            tracer = ___tracer_cls___(
-                **___tracer_kwargs___,
-            )
+        #     if target is None and p_self.run != _HOOKS_["multiprocessing.Process.run"]:
+        #         target = p_self.run
+        #         args = ()
+        #         kwargs = {}
+        #         p_self.run = _HOOKS_["multiprocessing.Process.run"]
 
-            def _signal_handler(
-                signum,
-                frame,
-                tracer,
-            ):
-                tracer.stop()
-                print(f"PROCESS {os.getpid()} EXIT ON SIGNAL {signum}")
-                os._exit(0)
+        #     elif target is None:
+        #         return _HOOKS_["multiprocessing.Process.__init__"](
+        #             p_self,
+        #             group=group,
+        #             target=target,
+        #             name=name,
+        #             args=args,
+        #             kwargs=kwargs,
+        #             daemon=daemon,
+        #         )
 
-            signal_handler = functools.partial(
-                _signal_handler,
-                tracer=tracer,
-            )
+        #     args = (
+        #         target,
+        #         self.__class__,
+        #         self._kwargs,
+        #     ) + args
 
-            signal.signal(signal.SIGTERM, signal_handler)
-            signal.signal(signal.SIGINT, signal_handler)
+        #     return _HOOKS_["multiprocessing.Process.__init__"](
+        #         p_self,
+        #         group=group,
+        #         target=_tracer_hook_worker_start,
+        #         name=name,
+        #         args=args,
+        #         kwargs=kwargs,
+        #         daemon=daemon,
+        #     )
 
-            tracer.start()
-            try:
-                return ___tracer_target___(*args, **kwargs)
-            finally:
-                print(f"PROCESS {os.getpid()} STOP")
-                tracer.stop()
+        # def _concurrent_future_processpoolexecutor_submit_(
+        #     p_self,
+        #     fn: Callable,
+        #     *args,
+        #     **kwargs,
+        # ) -> concurrent.futures.Future:
+
+        #     wrapped_func = functools.partial(
+        #         _tracer_hook_target,
+        #         ___tracer_target___=fn,
+        #         ___tracer_cls___=self.__class__,
+        #         ___tracer_kwargs___=self._kwargs,
+        #     )
+
+        #     return _HOOKS_["concurrent.future.ProcessPoolExecutor.submit"](
+        #         p_self,
+        #         wrapped_func,
+        #         *args,
+        #         **kwargs,
+        #     )
+
+        # def _concurrent_future_processpoolexecutor_map_(
+        #     p_self,
+        #     fn: Callable,
+        #     *iterables,
+        #     timeout=None,
+        #     chunksize=1,
+        # ):
+        #     wrapped_func = functools.partial(
+        #         _tracer_hook_target,
+        #         ___tracer_target___=fn,
+        #         ___tracer_cls___=self.__class__,
+        #         ___tracer_kwargs___=self._kwargs,
+        #     )
+
+        #     return _HOOKS_["concurrent.future.ProcessPoolExecutor.map"](
+        #         p_self,
+        #         wrapped_func,
+        #         *iterables,
+        #         timeout=timeout,
+        #         chunksize=chunksize,
+        #     )
+
+        # def _multiprocessing_pool_pool_map_async_(
+        #     p_self,
+        #     func: Callable,
+        #     iterable,
+        #     mapper,
+        #     chunksize=None,
+        #     callback=None,
+        #     error_callback=None,
+        # ):
+        #     wrapped_func = functools.partial(
+        #         _tracer_hook_target,
+        #         ___tracer_target___=func,
+        #         ___tracer_cls___=self.__class__,
+        #         ___tracer_kwargs___=self._kwargs,
+        #     )
+
+        #     return _HOOKS_["multiprocessing.pool.Pool._map_async"](
+        #         p_self,
+        #         wrapped_func,
+        #         iterable,
+        #         mapper,
+        #         chunksize=chunksize,
+        #         callback=callback,
+        #         error_callback=error_callback,
+        #     )
+
+        # def _multiprocessing_pool_pool_apply_async_(
+        #     p_self,
+        #     func,
+        #     args=(),
+        #     kwds={},
+        #     callback=None,
+        #     error_callback=None,
+        # ):
+        #     wrapped_func = functools.partial(
+        #         _tracer_hook_target,
+        #         ___tracer_target___=func,
+        #         ___tracer_cls___=self.__class__,
+        #         ___tracer_kwargs___=self._kwargs,
+        #     )
+
+        #     return _HOOKS_["multiprocessing.pool.Pool.apply_async"](
+        #         p_self,
+        #         wrapped_func,
+        #         args=args,
+        #         kwds=kwds,
+        #         callback=callback,
+        #         error_callback=error_callback,
+        #     )
+
+        # def _multiprocessing_pool_pool_imap_(
+        #     p_self,
+        #     func,
+        #     iterable,
+        #     chunksize=1,
+        # ):
+        #     wrapped_func = functools.partial(
+        #         _tracer_hook_target,
+        #         ___tracer_target___=func,
+        #         ___tracer_cls___=self.__class__,
+        #         ___tracer_kwargs___=self._kwargs,
+        #     )
+
+        #     return _HOOKS_["multiprocessing.pool.Pool.imap"](
+        #         p_self,
+        #         wrapped_func,
+        #         iterable,
+        #         chunksize=chunksize,
+        #     )
+
+        # def _multiprocessing_pool_pool_imap_unordered_(
+        #     p_self,
+        #     func,
+        #     iterable,
+        #     chunksize=1,
+        # ):
+        #     wrapped_func = functools.partial(
+        #         _tracer_hook_target,
+        #         ___tracer_target___=func,
+        #         ___tracer_cls___=self.__class__,
+        #         ___tracer_kwargs___=self._kwargs,
+        #     )
+
+        #     return _HOOKS_["multiprocessing.pool.Pool.imap_unordered"](
+        #         p_self,
+        #         wrapped_func,
+        #         iterable,
+        #         chunksize=chunksize,
+        #     )
 
         def _multiprocess_process_init_before(
-            _: Dict,
             kwargs: Dict,
+            context: Dict,
         ):
-            target = kwargs.get("target", None)
+            target: Callable = kwargs.get("target", None)
 
-            if target is None:
-                process = kwargs.get("self", None)
-                target = getattr(process, "run")
-                setattr(
-                    process,
-                    "run",
-                    functools.partial(
-                        getattr(multiprocessing.process.BaseProcess, "run"),
-                        process,
-                    ),
+            def _target(
+                *args,
+                ___tracer_target___,
+                ___tracer_cls___,
+                ___tracer_kwargs___,
+                **kwargs,
+            ):
+                tracer = ___tracer_cls___(
+                    **___tracer_kwargs___,
                 )
 
-            kwargs["target"] = functools.partial(
-                _hook,
+                def _signal_handler(
+                    signum,
+                    frame,
+                    tracer,
+                ):
+                    tracer.stop()
+                    os._exit(0)
+
+                signal_handler = functools.partial(
+                    _signal_handler,
+                    tracer=tracer,
+                )
+
+                signal.signal(signal.SIGTERM, signal_handler)
+                signal.signal(signal.SIGINT, signal_handler)
+
+                tracer.start()
+                try:
+                    return ___tracer_target___(*args, **kwargs)
+                finally:
+                    tracer.stop()
+
+            target = functools.partial(
+                _target,
                 ___tracer_target___=target,
                 ___tracer_cls___=self.__class__,
                 ___tracer_kwargs___=self._kwargs,
             )
 
-        try:
-            import multiprocessing.process
+            return kwargs
 
-            self._hook_context.hook(
-                obj=multiprocessing.process.BaseProcess,
-                name="__init__",
-                before=_multiprocess_process_init_before,
-            )
-        except ImportError:
-            pass
+        # self._hook_context.hook(
+        #     obj=multiprocessing.Process,
+        #     name="__init__",
+        #     new_func=_multiprocessing_process_init_,
+        # )
 
-        try:
-            import multiprocess.process
-
-            self._hook_context.hook(
-                obj=multiprocess.process.BaseProcess,
-                name="__init__",
-                before=_multiprocess_process_init_before,
-            )
-        except ImportError:
-            pass
+        # setattr(
+        #     multiprocessing.Process,
+        #     "__init__",
+        #     _multiprocessing_process_init_,
+        # )
+        # setattr(
+        #     concurrent.futures.ProcessPoolExecutor,
+        #     "submit",
+        #     _concurrent_future_processpoolexecutor_submit_,
+        # )
+        # setattr(
+        #     concurrent.futures.ProcessPoolExecutor,
+        #     "map",
+        #     _concurrent_future_processpoolexecutor_map_,
+        # )
+        # setattr(
+        #     multiprocessing.pool.Pool,
+        #     "_map_async",
+        #     _multiprocessing_pool_pool_map_async_,
+        # )
+        # setattr(
+        #     multiprocessing.pool.Pool,
+        #     "apply_async",
+        #     _multiprocessing_pool_pool_apply_async_,
+        # )
+        # setattr(
+        #     multiprocessing.pool.Pool,
+        #     "imap",
+        #     _multiprocessing_pool_pool_imap_,
+        # )
+        # setattr(
+        #     multiprocessing.pool.Pool,
+        #     "imap_unordered",
+        #     _multiprocessing_pool_pool_imap_unordered_,
+        # )
 
     def _stop_hook(
         self,
@@ -472,6 +748,42 @@ class BaseTracer(ABC):
 
         self._hook_context.unhook_all()
 
+        # setattr(
+        #     multiprocessing.Process,
+        #     "__init__",
+        #     _HOOKS_["multiprocessing.Process.__init__"],
+        # )
+        # setattr(
+        #     concurrent.futures.ProcessPoolExecutor,
+        #     "submit",
+        #     _HOOKS_["concurrent.future.ProcessPoolExecutor.submit"],
+        # )
+        # setattr(
+        #     concurrent.futures.ProcessPoolExecutor,
+        #     "map",
+        #     _HOOKS_["concurrent.future.ProcessPoolExecutor.map"],
+        # )
+        # setattr(
+        #     multiprocessing.pool.Pool,
+        #     "_map_async",
+        #     _HOOKS_["multiprocessing.pool.Pool._map_async"],
+        # )
+        # setattr(
+        #     multiprocessing.pool.Pool,
+        #     "apply_async",
+        #     _HOOKS_["multiprocessing.pool.Pool.apply_async"],
+        # )
+        # setattr(
+        #     multiprocessing.pool.Pool,
+        #     "imap",
+        #     _HOOKS_["multiprocessing.pool.Pool.imap"],
+        # )
+        # setattr(
+        #     multiprocessing.pool.Pool,
+        #     "imap_unordered",
+        #     _HOOKS_["multiprocessing.pool.Pool.imap_unordered"],
+        # )
+
     def _stop_save(
         self,
     ) -> None:
@@ -480,31 +792,25 @@ class BaseTracer(ABC):
             for thread, trace in self._get_results().items():
                 with open(
                     self._dest_dir
-                    / f"tracer__ppid-{os.getppid()}__pid-{os.getpid()}__thread-{thread.name}.json",
+                    / f"tracer__ppid-{os.getppid()}__pid-{os.getpid()}__thread-{thread.name}__{time.time()}.json",
                     "w",
                 ) as f:
                     json.dump(trace, f, indent=4)
 
     def start(self):
-        if self._status == BaseTracer.Status.STOPPED:
-            raise RuntimeError("Tracer has been stopped and cannot be restarted.")
-        if self._status == BaseTracer.Status.STARTED:
+        if self._is_started:
             return
-        self._status = BaseTracer.Status.UNKNOWN
+        self._is_started = True
         self._start_trace()
         self._start_hook()
-        self._status = BaseTracer.Status.STARTED
 
     def stop(self):
-        if self._status == BaseTracer.Status.INIT:
-            raise RuntimeError("Tracer has not been started.")
-        if self._status == BaseTracer.Status.STOPPED:
+        if not self._is_started:
             return
-        self._status = BaseTracer.Status.UNKNOWN
+        self._is_started = False
         self._stop_trace()
         self._stop_hook()
         self._stop_save()
-        self._status = BaseTracer.Status.STOPPED
 
     def __enter__(self):
         self.start()
@@ -522,7 +828,6 @@ class BaseTracer(ABC):
         self,
     ) -> Dict[threading.Thread, Dict]:
         results = {}
-
         for thread, value in self._thread_contexts.items():
 
             # repair broken stacks due to abnormal termination

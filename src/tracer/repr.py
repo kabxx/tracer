@@ -5,7 +5,7 @@ from inspect import isclass
 import io
 import os
 import reprlib
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, override
+from typing import Any, Callable, Dict, Optional, Tuple, Union, override
 import re
 import numpy as np
 
@@ -48,7 +48,7 @@ _PrimitiveType = (
 )
 
 
-def _safe_repr(
+def safe_repr(
     val: Any,
 ) -> str:
     try:
@@ -59,7 +59,7 @@ def _safe_repr(
         )
 
 
-def _safe_str(
+def safe_str(
     val: Any,
 ) -> str:
     try:
@@ -82,7 +82,7 @@ class SafeReprHelper(AbstractReprHelper):
         self,
         obj: Any,
     ) -> str:
-        return _safe_repr(obj)
+        return safe_repr(obj)
 
 
 class ReprLibReprHelper(AbstractReprHelper):
@@ -257,10 +257,10 @@ class V1ReprRegistryHelper(AbstractReprRegistryHelper):
             return helper.repr(obj)
 
         if cls.__repr__ is not object.__repr__:
-            return _safe_repr(obj)
+            return safe_repr(obj)
 
         if cls.__str__ is not object.__str__:
-            return _safe_str(obj)
+            return safe_str(obj)
 
         obj_id = id(obj)
         try:
@@ -402,11 +402,11 @@ class RichReprRegistryHelper(AbstractReprRegistryHelper):
             return
 
         if cls.__repr__ is not object.__repr__:
-            tree.add(_safe_repr(obj))
+            tree.add(safe_repr(obj))
             return
 
         if cls.__str__ is not object.__str__:
-            tree.add(_safe_str(obj))
+            tree.add(safe_str(obj))
             return
 
         obj_id = id(obj)
@@ -440,7 +440,7 @@ class RichReprRegistryHelper(AbstractReprRegistryHelper):
                 except:
                     pass
             if not attrs:
-                tree.add(_safe_repr(obj))
+                tree.add(safe_repr(obj))
                 return
 
             attrs.sort()
@@ -463,9 +463,16 @@ class RichReprRegistryHelper(AbstractReprRegistryHelper):
         obj: Any,
         max_depth: int = 3,
     ) -> str:
+        cls = type(obj)
 
         if helper := self.helper(obj):
             return helper.repr(obj)
+
+        if cls.__repr__ is not object.__repr__:
+            return safe_repr(obj)
+
+        if cls.__str__ is not object.__str__:
+            return safe_str(obj)
 
         buf = io.StringIO()
         console = Console(file=buf)
@@ -479,7 +486,6 @@ class RichReprRegistryHelper(AbstractReprRegistryHelper):
         )
         console.print(tree)
         result = buf.getvalue().strip()
-        cls = type(obj)
         if cls in _CollectionTypes and hasattr(cls, "__len__"):
             try:
                 result += f"\n(length: {len(obj)})"
@@ -490,3 +496,14 @@ class RichReprRegistryHelper(AbstractReprRegistryHelper):
             if bases:
                 result += f"\n(bases: {', '.join(bases)})"
         return result
+
+
+class ReprWrapperClass:
+    def __init__(
+        self,
+        obj: Any,
+    ):
+        self._repr = safe_repr(obj)
+
+    def __repr__(self):
+        return self._repr
