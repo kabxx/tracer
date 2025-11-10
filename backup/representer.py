@@ -54,9 +54,7 @@ def safe_repr(
     try:
         return repr(val)
     except Exception as e:
-        return (
-            f"<unrepresentable object {type(val).__name__} of {str(e)}>"
-        )
+        return f"<unrepresentable object {type(val).__name__} of {str(e)}>"
 
 
 def safe_str(
@@ -151,7 +149,7 @@ class NumpyArrayListReprHelper(AbstractReprHelper):
         return result
 
 
-class AbstractReprRegistryHelper(AbstractReprHelper):
+class AbstractRegisterRepresenter(AbstractReprHelper):
     def __init__(self):
         self._type_helpers: Dict[Tuple[type, ...], AbstractReprHelper] = {}
         self._cond_helpers: Dict[Tuple[Callable, ...], AbstractReprHelper] = {}
@@ -217,7 +215,7 @@ class AbstractReprRegistryHelper(AbstractReprHelper):
     def setup(self) -> None: ...
 
 
-class V1ReprRegistryHelper(AbstractReprRegistryHelper):
+class V1RegisterRepresenter(AbstractRegisterRepresenter):
 
     def setup(self):
         rlrh = ReprLibReprHelper()
@@ -362,7 +360,7 @@ class V1ReprRegistryHelper(AbstractReprRegistryHelper):
         return result
 
 
-class RichReprRegistryHelper(AbstractReprRegistryHelper):
+class RichReprRegistryHelper(AbstractRegisterRepresenter):
     def setup(self):
         rrh = RichReprHelper()
         self.register(
@@ -500,14 +498,3 @@ class RichReprRegistryHelper(AbstractReprRegistryHelper):
             if bases:
                 result += f"\n(bases: {', '.join(bases)})"
         return result
-
-
-class ReprWrapperClass:
-    def __init__(
-        self,
-        obj: Any,
-    ):
-        self._repr = safe_repr(obj)
-
-    def __repr__(self):
-        return self._repr

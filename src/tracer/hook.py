@@ -12,9 +12,9 @@ class HookContext:
         self,
         obj: Any,
         name: str,
-        before: Optional[Callable[[Dict, Dict], Dict]] = None,
+        before: Optional[Callable[[Dict, Dict], None]] = None,
         after: Optional[
-            Callable[[Dict, Optional[Any], Optional[BaseException], Dict], None]
+            Callable[[Dict, Dict, Optional[Any], Optional[BaseException]], None]
         ] = None,
     ):
         value = getattr(
@@ -27,40 +27,39 @@ class HookContext:
 
         self._patches[(obj, name)] = value
 
-        context = {}
-        before = functools.partial(before, context) if before else None
-        after = functools.partial(after, context) if after else None
-
         def _binder(
             *args,
-            **kwargs,
+            **kwds,
         ) -> Dict[str, Any]:
             sig = inspect.signature(value)
-            args = sig.bind(*args, **kwargs)
+            args = sig.bind(*args, **kwds)
             args.apply_defaults()
             return args.arguments
 
         def _hooker(
             *args,
-            **kwargs,
+            **kwds,
         ):
-            kwargs = _binder(
+            context = {}
+
+            kwds = _binder(
                 *args,
-                **kwargs,
+                **kwds,
             )
             if before is not None:
                 before(
-                    kwargs,
+                    context,
+                    kwds,
                 )
             retval, error = None, None
             try:
-                retval = value(**kwargs)
+                retval = value(**kwds)
             except BaseException as e:
                 error = e
                 raise error
             finally:
                 if after is not None:
-                    after(kwargs, retval, error)
+                    after(context, kwds, retval, error)
 
         setattr(
             obj,

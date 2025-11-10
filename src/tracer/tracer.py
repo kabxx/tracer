@@ -1,12 +1,15 @@
 import json
 import os
 from pathlib import Path
+import pickle
 import sys
 import threading
 import time
 import traceback
 import functools
 import signal
+import threading
+
 
 from types import FrameType, TracebackType
 from typing import (
@@ -19,19 +22,14 @@ from typing import (
     Type,
     TypedDict,
     Union,
-    override,
 )
+
+from typing_extensions import override
 
 from enum import Enum
 from abc import abstractmethod, ABC
 
-from tracer.utils import (
-    V1ReprRegistryHelper,
-    RichReprRegistryHelper,
-    ReprWrapperClass,
-    HookContext,
-    Serializer,
-)
+from tracer.utils import HookContext, Serializer, Representer
 
 _StrOrPath = Union[str, Path]
 
@@ -68,7 +66,8 @@ class TracerThreadContext:
         self,
         thread: threading.Thread,
     ):
-        self._thread = thread
+        self._thread_name = thread.name
+        self._thread_id = thread.ident
         self._stacks: List[FunctionDict] = [
             {
                 "file": None,
@@ -111,9 +110,9 @@ class BaseTracer(ABC):
         skip_empty_thread: bool = True,
         only_main_process: bool = False,
     ):
-        kwargs = locals()
-        kwargs.pop("self")
-        self._kwargs = kwargs.copy()
+        kwds = locals()
+        kwds.pop("self")
+        self._kwds = kwds.copy()
 
         self._status: BaseTracer.Status = BaseTracer.Status.INIT
 
@@ -133,7 +132,11 @@ class BaseTracer(ABC):
         # trace thread
         self._only_main_thread = only_main_thread
         self._skip_empty_thread = skip_empty_thread
-        self._thread_contexts: Dict[threading.Thread, TracerThreadContext] = {}
+        # self._thread_contexts: Dict[threading.Thread, TracerThreadContext] = {}
+
+        self._thread_lock = threading.Lock()
+        self._thread_local = threading.local()
+        self._thread_contexts: List[TracerThreadContext] = []
 
         # trace process
         self._only_main_process = only_main_process
@@ -147,6 +150,8 @@ class BaseTracer(ABC):
         event: str,
         arg: Any,
     ) -> Optional[Callable[[FrameType, str, Any], Any]]:
+
+        # print(".",flush=False,end="")
 
         # update depth
         if event == "call":
@@ -169,13 +174,13 @@ class BaseTracer(ABC):
             ):
                 return self.trace
 
-        if event == "call" and False:
-            print(
-                f"TRACE CALL {frame.f_code.co_name} IN {frame.f_code.co_filename} AT LINE {frame.f_lineno} THREAD {os.getpid()}-{threading.current_thread().name} TIME {time.time()}"
-            )  # DEBUG
+        # if event == "call" and True:
+        #     print(
+        #         f"TRACE CALL [{self._current_thread_depth_get()}] {frame.f_lineno} {frame.f_code.co_name} IN {frame.f_code.co_filename} TIME {time.time()}",
+        #         flush=False,
+        #     )  # DEBUG
 
         if event == "call":
-
             locals = self._snapshot_variables(frame.f_locals)
 
             # create function trace
@@ -280,10 +285,13 @@ class BaseTracer(ABC):
     def _current_thread_context(
         self,
     ) -> TracerThreadContext:
-        thread = threading.current_thread()
-        if thread not in self._thread_contexts:
-            self._thread_contexts[thread] = TracerThreadContext(thread)
-        return self._thread_contexts[thread]
+        if hasattr(self._thread_local, "context"):
+            return getattr(self._thread_local, "context")
+        thread_context = TracerThreadContext(thread=threading.current_thread())
+        setattr(self._thread_local, "context", thread_context)
+        with self._thread_lock:
+            self._thread_contexts.append(thread_context)
+        return thread_context
 
     def _current_thread_depth_get(
         self,
@@ -381,13 +389,13 @@ class BaseTracer(ABC):
             *args,
             ___tracer_target___,
             ___tracer_cls___,
-            ___tracer_kwargs___,
-            **kwargs,
+            ___tracer_kwds___,
+            **kwds,
         ):
             print(f"PROCESS {os.getpid()} START")
 
             tracer = ___tracer_cls___(
-                **___tracer_kwargs___,
+                **___tracer_kwds___,
             )
 
             def _signal_handler(
@@ -409,19 +417,19 @@ class BaseTracer(ABC):
 
             tracer.start()
             try:
-                return ___tracer_target___(*args, **kwargs)
+                return ___tracer_target___(*args, **kwds)
             finally:
                 print(f"PROCESS {os.getpid()} STOP")
                 tracer.stop()
 
         def _multiprocessing_process_init_before(
             _: Dict,
-            kwargs: Dict,
+            kwds: Dict,
         ):
-            target = kwargs.get("target", None)
+            target = kwds.get("target", None)
 
             if target is None:
-                process = kwargs.get("self", None)
+                process = kwds.get("self", None)
                 target = getattr(process, "run")
                 setattr(
                     process,
@@ -432,11 +440,11 @@ class BaseTracer(ABC):
                     ),
                 )
 
-            kwargs["target"] = functools.partial(
+            kwds["target"] = functools.partial(
                 _hook,
                 ___tracer_target___=target,
                 ___tracer_cls___=self.__class__,
-                ___tracer_kwargs___=self._kwargs,
+                ___tracer_kwds___=self._kwds,
             )
 
         try:
@@ -475,10 +483,10 @@ class BaseTracer(ABC):
     ) -> None:
         if self._dest_dir:
             self._dest_dir.mkdir(parents=True, exist_ok=True)
-            for thread, trace in self._make_results().items():
+            for (thread_id, thread_name), trace in self._make_results().items():
                 with open(
                     self._dest_dir
-                    / f"tracer__ppid-{os.getppid()}__pid-{os.getpid()}__thread-{thread.name}.json",
+                    / f"tracer__ppid-{os.getppid()}__pid-{os.getpid()}__thread-{thread_name}.json",
                     "w",
                 ) as f:
                     json.dump(trace, f, indent=4)
@@ -527,11 +535,11 @@ class BaseTracer(ABC):
     ) -> Dict[threading.Thread, Dict]:
         results = {}
 
-        for thread, value in self._thread_contexts.items():
+        for thread_context in self._thread_contexts:
 
             # repair broken stacks due to abnormal termination
-            while len(value._stacks) > 1:
-                function = value._stacks.pop()
+            while len(thread_context._stacks) > 1:
+                function = thread_context._stacks.pop()
                 function["retval"] = "<function is terminated>"
 
                 if self._trace_locals:
@@ -542,8 +550,8 @@ class BaseTracer(ABC):
                     if self._only_trace_changed_globals:
                         del function["__global_snapshot__"]
 
-                if not value._stacks[-1]["traces"]:
-                    value._stacks[-1]["traces"].append(
+                if not thread_context._stacks[-1]["traces"]:
+                    thread_context._stacks[-1]["traces"].append(
                         {
                             "line": "<unknown line>",
                             "locals": "<unknown locals>",
@@ -552,13 +560,16 @@ class BaseTracer(ABC):
                         }
                     )
 
-                value._stacks[-1]["traces"][-1]["functions"].append(function)
+                thread_context._stacks[-1]["traces"][-1]["functions"].append(function)
             # repair broken stacks end
 
-            value = value._stacks[0]["traces"][0]["functions"]
+            value = thread_context._stacks[0]["traces"][0]["functions"]
+
             if self._skip_empty_thread and not value:
                 continue
-            results[thread] = value
+
+            results[(thread_context._thread_id, thread_context._thread_name)] = value
+
         return results
 
     @abstractmethod
@@ -585,11 +596,11 @@ class BaseTracer(ABC):
         exception_value: BaseException,
     ) -> str: ...
 
-    @abstractmethod
     def _output_by_exc_traceback(
         self,
         exception_traceback: TracebackType,
-    ) -> str: ...
+    ) -> str:
+        return "\n".join(traceback.format_tb(exception_traceback))
 
     @abstractmethod
     def _snapshot_variable(
@@ -618,7 +629,7 @@ class BaseTracer(ABC):
     ) -> Dict[str, Any]: ...
 
 
-class _V3ReprTracer(BaseTracer):
+class ReprTracer(BaseTracer):
 
     def __init__(
         self,
@@ -633,7 +644,7 @@ class _V3ReprTracer(BaseTracer):
         only_main_thread: bool = False,
         skip_empty_thread: bool = True,
         only_main_process: bool = False,
-        seralizer_backend: Literal["pickle", "dill", "joblib"] = "pickle",
+        serializer_backend: Literal["pickle", "dill"] = "pickle",
     ):
         super().__init__(
             dest_dir=dest_dir,
@@ -649,32 +660,62 @@ class _V3ReprTracer(BaseTracer):
             only_main_process=only_main_process,
         )
 
-        self._helper = RichReprRegistryHelper()
+        self._representer = Representer()
 
         self._serializer = Serializer(
-            backend=seralizer_backend,
+            backend=serializer_backend,
         )
 
     class SnapShotVariable:
         def __init__(
             self,
-            bytes: bytes,
-            repr: str,
+            variable: Any,
+            serializer: Serializer,
+            representer: Representer,
         ):
-            self._bytes = bytes
-            self._repr = repr
+            try:
+                self._type = type(variable)
+            except:
+                self._type = None
 
-        def __bytes__(self):
+            self._repr = representer.repr(variable)
+
+            try:
+                self._bytes = serializer.dumps(variable)
+            except:
+                self._bytes = serializer.dumps(self._repr)
+
+        def __bytes__(
+            self,
+        ):
             return self._bytes
 
-        def __repr__(self):
+        def __repr__(
+            self,
+        ):
             return self._repr
+
+        def __eq__(
+            self,
+            value: "ReprTracer.SnapShotVariable",
+        ):
+            return self._type == value._type and bytes(self) == bytes(value)
+
+    def seralizer(
+        self,
+    ) -> Serializer:
+        return self._serializer
+
+    def representer(
+        self,
+    ) -> Representer:
+        return self._representer
 
     def repr(
         self,
         var: Any,
     ) -> str:
-        return self._helper.repr(var)
+        return self._representer.repr(var)
 
     def serialize(
         self,
@@ -687,11 +728,6 @@ class _V3ReprTracer(BaseTracer):
         data: bytes,
     ) -> Any:
         return self._serializer.loads(data)
-
-    def helper(
-        self,
-    ) -> V1ReprRegistryHelper:
-        return self._helper
 
     @override
     def _output_by_exc_type(
@@ -708,38 +744,21 @@ class _V3ReprTracer(BaseTracer):
         return self.repr(exception_value)
 
     @override
-    def _output_by_exc_traceback(
-        self,
-        exception_traceback: TracebackType,
-    ) -> str:
-        return "\n".join(traceback.format_tb(exception_traceback))
-
-    @override
     def _snapshot_variable(
         self,
         variable: Any,
     ) -> SnapShotVariable:
-        # try:
-        #     return self.serialize(variable)
-        # except:
-        #     return self.serialize(ReprWrapperClass(variable))
-        try:
-            return self.SnapShotVariable(
-                bytes=self.serialize(variable),
-                repr=self.repr(variable),
-            )
-        except:
-            return self.SnapShotVariable(
-                bytes=self.serialize(ReprWrapperClass(variable)),
-                repr=self.repr(variable),
-            )
+        return self.SnapShotVariable(
+            variable=variable,
+            serializer=self._serializer,
+            representer=self._representer,
+        )
 
     @override
     def _output_from_snapshot_variable(
         self,
         variable: SnapShotVariable,
     ) -> str:
-        # return self.repr(self.deserialize(variable))
         return repr(variable)
 
     @override
@@ -748,11 +767,7 @@ class _V3ReprTracer(BaseTracer):
         v1: SnapShotVariable,
         v2: SnapShotVariable,
     ) -> bool:
-        # return v1 == v2
-        try:
-            return bytes(v1) == bytes(v2)
-        except:
-            return repr(v1) == repr(v2)
+        return v1 == v2
 
     @override
     def _diff_snapshot_variables(
@@ -767,4 +782,4 @@ class _V3ReprTracer(BaseTracer):
         }
 
 
-Tracer = _V3ReprTracer
+Tracer = ReprTracer

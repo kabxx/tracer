@@ -32,10 +32,10 @@ from abc import abstractmethod, ABC
 from tracer.utils import (
     deep_equal,
     deep_copy,
-    V1ReprRegistryHelper,
+    V1RegisterRepresenter,
     safe_repr,
-    RichReprRegistryHelper,
-    ReprWrapperClass,
+    SafeRichRegistryRepresenter,
+    SerializableReprWrapperClass,
     HookContext,
 )
 
@@ -1011,11 +1011,11 @@ class _V2ReprTracer(BaseTracer):
             only_main_process=only_main_process,
         )
 
-        self._helper = RichReprRegistryHelper()
+        self._helper = SafeRichRegistryRepresenter()
 
     def helper(
         self,
-    ) -> V1ReprRegistryHelper:
+    ) -> V1RegisterRepresenter:
         return self._helper
 
     @override
@@ -1123,7 +1123,7 @@ class _V3ReprTracer(BaseTracer):
             only_main_process=only_main_process,
         )
 
-        self._helper = RichReprRegistryHelper()
+        self._helper = SafeRichRegistryRepresenter()
 
     def repr(
         self,
@@ -1133,7 +1133,7 @@ class _V3ReprTracer(BaseTracer):
 
     def helper(
         self,
-    ) -> V1ReprRegistryHelper:
+    ) -> V1RegisterRepresenter:
         return self._helper
 
     @override
@@ -1190,7 +1190,7 @@ class _V3ReprTracer(BaseTracer):
         try:
             return dill.loads(dill.dumps(variable))
         except:
-            return ReprWrapperClass(variable)
+            return SerializableReprWrapperClass(variable)
 
     @override
     def _diff_variables(
