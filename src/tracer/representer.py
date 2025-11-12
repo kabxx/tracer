@@ -1,9 +1,6 @@
 from abc import ABC, abstractmethod
-from array import array
-from collections import deque
 from inspect import isclass
 import io
-import os
 import reprlib
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 from typing_extensions import override
@@ -15,38 +12,9 @@ from rich.console import Console
 from rich.pretty import Pretty
 from rich.pretty import _is_attr_object, _is_namedtuple, is_dataclass
 
-from collections import defaultdict, Counter, UserDict, UserList
-from types import MappingProxyType
 
-_CollectionTypes = (
-    os._Environ,
-    array,
-    defaultdict,
-    Counter,
-    deque,
-    dict,
-    UserDict,
-    frozenset,
-    list,
-    UserList,
-    set,
-    tuple,
-    MappingProxyType,
-)
 
-_StringTypes = (
-    str,
-    bytes,
-    bytearray,
-)
-
-_PrimitiveType = (
-    bool,
-    int,
-    float,
-    complex,
-    type(None),
-)
+from tracer.types import *
 
 
 def safe_repr(
@@ -223,15 +191,15 @@ class SafeRichRegistryRepresenter(AbstractRegistryRepresenter):
     def setup(self):
         rrh = RichRepresenter()
         self.register(
-            _CollectionTypes,
+            CollectionTypes,
             rrh,
         )
         self.register(
-            _StringTypes,
+            StringTypes,
             rrh,
         )
         self.register(
-            _PrimitiveType,
+            PrimitiveType,
             rrh,
         )
         self.register(
@@ -345,7 +313,7 @@ class SafeRichRegistryRepresenter(AbstractRegistryRepresenter):
             console.print(tree)
             result = buf.getvalue().strip()
             try:
-                if cls in _CollectionTypes and hasattr(cls, "__len__"):
+                if cls in CollectionTypes and hasattr(cls, "__len__"):
                     result += f"\n(length: {len(obj)})"
             except:
                 pass

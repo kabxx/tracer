@@ -1,10 +1,8 @@
 import json
 import os
 from pathlib import Path
-import pickle
 import sys
 import threading
-import time
 import traceback
 import functools
 import signal
@@ -29,7 +27,13 @@ from typing_extensions import override
 from enum import Enum
 from abc import abstractmethod, ABC
 
-from tracer.utils import HookContext, Serializer, Representer
+from tracer.utils import (
+    HookContext,
+    Serializer,
+    Representer,
+    safe_repr,
+    get_type_full_name,
+)
 
 _StrOrPath = Union[str, Path]
 
@@ -645,6 +649,7 @@ class ReprTracer(BaseTracer):
         skip_empty_thread: bool = True,
         only_main_process: bool = False,
         serializer_backend: Literal["pickle", "dill"] = "pickle",
+        skip_types: Optional[List[str]] = None,
     ):
         super().__init__(
             dest_dir=dest_dir,
@@ -660,6 +665,8 @@ class ReprTracer(BaseTracer):
             only_main_process=only_main_process,
         )
 
+        self._skip_types = skip_types or []
+
         self._representer = Representer()
 
         self._serializer = Serializer(
@@ -669,21 +676,13 @@ class ReprTracer(BaseTracer):
     class SnapShotVariable:
         def __init__(
             self,
-            variable: Any,
-            serializer: Serializer,
-            representer: Representer,
+            type: Any,
+            repr: str,
+            bytes: bytes,
         ):
-            try:
-                self._type = type(variable)
-            except:
-                self._type = None
-
-            self._repr = representer.repr(variable)
-
-            try:
-                self._bytes = serializer.dumps(variable)
-            except:
-                self._bytes = serializer.dumps(self._repr)
+            self._type = type
+            self._repr = repr
+            self._bytes = bytes
 
         def __bytes__(
             self,
@@ -701,7 +700,7 @@ class ReprTracer(BaseTracer):
         ):
             return self._type == value._type and bytes(self) == bytes(value)
 
-    def seralizer(
+    def serializer(
         self,
     ) -> Serializer:
         return self._serializer
@@ -748,11 +747,23 @@ class ReprTracer(BaseTracer):
         self,
         variable: Any,
     ) -> SnapShotVariable:
-        return self.SnapShotVariable(
-            variable=variable,
-            serializer=self._serializer,
-            representer=self._representer,
-        )
+
+        cls = type(variable)
+        cls_full_name = get_type_full_name(cls)
+        # skip
+        if not cls_full_name or any(
+            cls_full_name.startswith(prefix) for prefix in self._skip_types
+        ):
+            repr = safe_repr(variable)
+            bytes = self.serialize(repr)
+            return self.SnapShotVariable(cls, repr, bytes)
+        # simple
+        repr = self.repr(variable)
+        try:
+            bytes = self.serialize(variable)
+        except:
+            bytes = self.serialize(repr)
+        return self.SnapShotVariable(cls, repr, bytes)
 
     @override
     def _output_from_snapshot_variable(
@@ -783,3 +794,84 @@ class ReprTracer(BaseTracer):
 
 
 Tracer = ReprTracer
+
+
+class DebugTracer:
+
+    def __init__(
+        self,
+        dest_dir: _StrOrPath,
+        includes: Optional[List[_StrOrPath]] = None,
+        skip_types: Optional[List[_StrOrPath]] = None,
+    ):
+        self.depth = 1
+
+        self.dest_dir: Path = Path(dest_dir)
+        self.includes = [str(p) for p in includes] if includes else []
+        self.skip_types = set(skip_types) if skip_types else set()
+
+        self._all_types = set()
+        self._skip_types = set()
+        self._remain_types = set()
+
+        self._serializer = Serializer(backend="pickle")
+        self._representer = Representer()
+
+    def __enter__(
+        self,
+    ):
+        sys.settrace(self.trace)
+        return self
+
+    def trace(self, frame: FrameType, event, arg):
+
+        file_path = frame.f_code.co_filename
+        if not any(
+            file_path.startswith(include_path) for include_path in self.includes
+        ):
+            return self.trace
+
+        for key, val in frame.f_locals.items():
+            type_full_name = get_type_full_name(type(val))
+            self._all_types.add(type_full_name)
+            if any(
+                type_full_name.startswith(skip_pattern)
+                for skip_pattern in self.skip_types
+            ):
+                self._skip_types.add(type_full_name)
+                repr = safe_repr(val)
+                bytes = self._serializer.dumps(repr)
+            else:
+                self._remain_types.add(type_full_name)
+                repr = self._representer.repr(val)
+                try:
+                    bytes = self._serializer.dumps(val)
+                except:
+                    bytes = self._serializer.dumps(repr)
+
+        return self.trace
+
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
+        sys.settrace(None)
+
+        self.dest_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(
+            Path(self.dest_dir)
+            / f"type_debugger__ppid-{os.getppid()}__pid-{os.getpid()}.json",
+            "w",
+        ) as f:
+            json.dump(
+                {
+                    "skip_types": sorted(list(self._skip_types)),
+                    "all_types": sorted(list(self._all_types)),
+                    "remain_types": sorted(list(self._remain_types)),
+                },
+                f,
+                indent=4,
+            )
