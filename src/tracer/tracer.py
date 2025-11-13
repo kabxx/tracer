@@ -714,19 +714,19 @@ class ReprTracer(BaseTracer):
         self,
         var: Any,
     ) -> str:
-        return self._representer.repr(var)
+        return self.representer().repr(var)
 
     def serialize(
         self,
         var: Any,
     ) -> bytes:
-        return self._serializer.dumps(var)
+        return self.serializer().dumps(var)
 
     def deserialize(
         self,
         data: bytes,
     ) -> Any:
-        return self._serializer.loads(data)
+        return self.serializer().loads(data)
 
     @override
     def _output_by_exc_type(
@@ -814,13 +814,15 @@ class DebugTracer:
         self._skip_types = set()
         self._remain_types = set()
 
+        self._thread_lock = threading.Lock()
+
         self._serializer = Serializer(backend="pickle")
         self._representer = Representer()
 
     def __enter__(
         self,
     ):
-        sys.settrace(self.trace)
+        threading.settrace_all_threads(self.trace)
         return self
 
     def trace(self, frame: FrameType, event, arg):
@@ -832,22 +834,32 @@ class DebugTracer:
             return self.trace
 
         for key, val in frame.f_locals.items():
+
             type_full_name = get_type_full_name(type(val))
-            self._all_types.add(type_full_name)
+
+            with self._thread_lock:
+                self._all_types.add(type_full_name)
+                
             if any(
                 type_full_name.startswith(skip_pattern)
                 for skip_pattern in self.skip_types
             ):
-                self._skip_types.add(type_full_name)
+
                 repr = safe_repr(val)
                 bytes = self._serializer.dumps(repr)
+
+                with self._thread_lock:
+                    self._skip_types.add(type_full_name)
             else:
-                self._remain_types.add(type_full_name)
+
                 repr = self._representer.repr(val)
                 try:
                     bytes = self._serializer.dumps(val)
                 except:
                     bytes = self._serializer.dumps(repr)
+
+                with self._thread_lock:
+                    self._remain_types.add(type_full_name)
 
         return self.trace
 
@@ -857,7 +869,7 @@ class DebugTracer:
         exc_value,
         traceback,
     ):
-        sys.settrace(None)
+        threading.settrace_all_threads(None)
 
         self.dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -868,9 +880,9 @@ class DebugTracer:
         ) as f:
             json.dump(
                 {
+                    "remain_types": sorted(list(self._remain_types)),
                     "skip_types": sorted(list(self._skip_types)),
                     "all_types": sorted(list(self._all_types)),
-                    "remain_types": sorted(list(self._remain_types)),
                 },
                 f,
                 indent=4,
