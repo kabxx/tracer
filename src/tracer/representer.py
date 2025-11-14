@@ -13,8 +13,17 @@ from rich.pretty import Pretty
 from rich.pretty import _is_attr_object, _is_namedtuple, is_dataclass
 
 
-
 from tracer.types import *
+
+
+def base_repr(
+    val: Any,
+) -> str:
+    try:
+        cls = type(val)
+        return f"<{val.__module__}.{cls.__name__} object at {id(val)}>"
+    except Exception as e:
+        return f"<unrepresentable object {type(val).__name__} of {str(e)}>"
 
 
 def safe_repr(
@@ -24,6 +33,15 @@ def safe_repr(
         return repr(val)
     except Exception as e:
         return f"<unrepresentable object {type(val).__name__} of {str(e)}>"
+
+
+def base_str(
+    val: Any,
+) -> str:
+    try:
+        return f"<{val.__module__}.{type(val).__name__} object>"
+    except Exception as e:
+        return f"<unstringable object {type(val).__name__} of {str(e)}>"
 
 
 def safe_str(

@@ -6,6 +6,7 @@ src/tracer/hook.py
 src/tracer/representer.py
 src/tracer/serializer.py
 src/tracer/tracer.py
+src/tracer/types.py
 src/tracer/utils.py
 src/tracer.egg-info/PKG-INFO
 src/tracer.egg-info/SOURCES.txt

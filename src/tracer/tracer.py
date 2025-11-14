@@ -32,6 +32,7 @@ from tracer.utils import (
     Serializer,
     Representer,
     safe_repr,
+    base_repr,
     get_type_full_name,
 )
 
@@ -649,7 +650,8 @@ class ReprTracer(BaseTracer):
         skip_empty_thread: bool = True,
         only_main_process: bool = False,
         serializer_backend: Literal["pickle", "dill"] = "pickle",
-        skip_types: Optional[List[str]] = None,
+        skip_repr_types: Optional[List[str]] = None,
+        skip_copy_types: Optional[List[str]] = None,
     ):
         super().__init__(
             dest_dir=dest_dir,
@@ -665,7 +667,8 @@ class ReprTracer(BaseTracer):
             only_main_process=only_main_process,
         )
 
-        self._skip_types = skip_types or []
+        self._skip_copy_types = set(skip_copy_types) if skip_copy_types else set()
+        self._skip_repr_types = set(skip_repr_types) if skip_repr_types else set()
 
         self._representer = Representer()
 
@@ -750,14 +753,17 @@ class ReprTracer(BaseTracer):
 
         cls = type(variable)
         cls_full_name = get_type_full_name(cls)
-        # skip
-        if not cls_full_name or any(
-            cls_full_name.startswith(prefix) for prefix in self._skip_types
-        ):
-            repr = safe_repr(variable)
-            bytes = self.serialize(repr)
-            return self.SnapShotVariable(cls, repr, bytes)
-        # simple
+
+        # skip repr
+        if any(cls_full_name.startswith(p) for p in self._skip_repr_types):
+            repr_str = base_repr(variable)
+            return self.SnapShotVariable(cls, repr_str, self.serialize(repr_str))
+
+        # skip copy
+        if any(cls_full_name.startswith(p) for p in self._skip_copy_types):
+            repr_str = self.repr(variable)
+            return self.SnapShotVariable(cls, repr_str, self.serialize(repr_str))
+        # normal
         repr = self.repr(variable)
         try:
             bytes = self.serialize(variable)
@@ -802,22 +808,38 @@ class DebugTracer:
         self,
         dest_dir: _StrOrPath,
         includes: Optional[List[_StrOrPath]] = None,
-        skip_types: Optional[List[_StrOrPath]] = None,
+        skip_copy_types: Optional[List[str]] = None,
+        skip_repr_types: Optional[List[str]] = None,
     ):
         self.depth = 1
 
         self.dest_dir: Path = Path(dest_dir)
         self.includes = [str(p) for p in includes] if includes else []
-        self.skip_types = set(skip_types) if skip_types else set()
 
-        self._all_types = set()
-        self._skip_types = set()
-        self._remain_types = set()
+        self._skip_copy_types = set(skip_copy_types) if skip_copy_types else set()
+        self._skip_repr_types = set(skip_repr_types) if skip_repr_types else set()
 
-        self._thread_lock = threading.Lock()
+        self._outputs = {
+            "skip_repr": [],
+            "skip_copy": [],
+            "remain": [],
+        }
+        self._lock = threading.Lock()
 
         self._serializer = Serializer(backend="pickle")
         self._representer = Representer()
+
+    def serialize(
+        self,
+        val: Any,
+    ) -> bytes:
+        return self._serializer.dumps(val)
+
+    def represent(
+        self,
+        val: Any,
+    ) -> str:
+        return self._representer.repr(val)
 
     def __enter__(
         self,
@@ -832,34 +854,35 @@ class DebugTracer:
             file_path.startswith(include_path) for include_path in self.includes
         ):
             return self.trace
-
         for key, val in frame.f_locals.items():
 
             type_full_name = get_type_full_name(type(val))
 
-            with self._thread_lock:
-                self._all_types.add(type_full_name)
-                
-            if any(
-                type_full_name.startswith(skip_pattern)
-                for skip_pattern in self.skip_types
-            ):
+            if any(type_full_name.startswith(p) for p in self._skip_repr_types):
+                # test
+                self.serialize(base_repr(val))
+                with self._lock:
+                    self._outputs["skip_repr"].append(type_full_name)
+                continue
 
-                repr = safe_repr(val)
-                bytes = self._serializer.dumps(repr)
+            if any(type_full_name.startswith(p) for p in self._skip_copy_types):
+                # test
+                self.serialize(self.represent(val))
+                with self._lock:
+                    self._outputs["skip_copy"].append(type_full_name)
+                continue
 
-                with self._thread_lock:
-                    self._skip_types.add(type_full_name)
-            else:
-
-                repr = self._representer.repr(val)
+            if True:
+                # test
                 try:
-                    bytes = self._serializer.dumps(val)
+                    self.serialize(val)
+                    self.represent(val)
                 except:
-                    bytes = self._serializer.dumps(repr)
+                    self.serialize(self.represent(val))
 
-                with self._thread_lock:
-                    self._remain_types.add(type_full_name)
+                with self._lock:
+                    self._outputs["remain"].append(type_full_name)
+                continue
 
         return self.trace
 
