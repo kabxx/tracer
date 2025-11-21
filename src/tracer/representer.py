@@ -21,7 +21,7 @@ def base_repr(
 ) -> str:
     try:
         cls = type(val)
-        return f"<{val.__module__}.{cls.__name__} object at {id(val)}>"
+        return f"<{cls.__module__}.{cls.__name__} object at {id(val)}>"
     except Exception as e:
         return f"<unrepresentable object {type(val).__name__} of {str(e)}>"
 
@@ -39,7 +39,8 @@ def base_str(
     val: Any,
 ) -> str:
     try:
-        return f"<{val.__module__}.{type(val).__name__} object>"
+        cls = type(val)
+        return f"<{cls.__module__}.{cls.__name__} object>"
     except Exception as e:
         return f"<unstringable object {type(val).__name__} of {str(e)}>"
 

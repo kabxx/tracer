@@ -17,6 +17,7 @@ from typing import (
     Optional,
     Dict,
     List,
+    Tuple,
     Type,
     TypedDict,
     Union,
@@ -31,7 +32,6 @@ from tracer.utils import (
     HookContext,
     Serializer,
     Representer,
-    safe_repr,
     base_repr,
     get_type_full_name,
 )
@@ -114,6 +114,8 @@ class BaseTracer(ABC):
         only_main_thread: bool = False,
         skip_empty_thread: bool = True,
         only_main_process: bool = False,
+        beg_func: Optional[Tuple[Optional[str], str]] = None,
+        end_func: Optional[Tuple[Optional[str], str]] = None,
     ):
         kwds = locals()
         kwds.pop("self")
@@ -149,21 +151,53 @@ class BaseTracer(ABC):
         # hook
         self._hook_context: HookContext = HookContext()
 
+        # begin func
+        if beg_func:
+            self._beg_func_ok = False
+            self._beg_func_path, self._beg_func_name = beg_func
+        else:
+            self._beg_func_ok = True
+            self._beg_func_path, self._beg_func_name = (None, None)
+
+        # end func
+        if end_func:
+            self._end_func_ok = False
+            self._end_func_path, self._end_func_name = end_func
+        else:
+            self._end_func_ok = True
+            self._end_func_path, self._end_func_name = (None, None)
+
     def trace(
         self,
         frame: FrameType,
         event: str,
         arg: Any,
     ) -> Optional[Callable[[FrameType, str, Any], Any]]:
-
-        # print(".",flush=False,end="")
-
+        
         # update depth
         if event == "call":
             self._current_thread_depth_set(self._current_thread_depth_get() + 1)
 
         elif event == "return":
             self._current_thread_depth_set(self._current_thread_depth_get() - 1)
+
+        file_path = frame.f_code.co_filename
+        func_name = frame.f_code.co_name
+
+        # begin & end function check
+        if not self._beg_func_ok:
+            if event == "return" and self._beg_func_name == func_name:
+                if not self._beg_func_path or file_path == self._beg_func_path:
+                    self._beg_func_ok = True
+            else:
+                return self.trace
+
+        if not self._end_func_ok:
+            if event == "return" and self._end_func_name == func_name:
+                if not self._end_func_path or file_path == self._end_func_path:
+                    self._end_func_ok = True
+        else:
+            return self.trace
 
         # check patterns
         if self._includes is not None:
@@ -652,6 +686,8 @@ class ReprTracer(BaseTracer):
         serializer_backend: Literal["pickle", "dill"] = "pickle",
         skip_repr_types: Optional[List[str]] = None,
         skip_copy_types: Optional[List[str]] = None,
+        beg_func: Optional[Tuple[Optional[str], str]] = None,
+        end_func: Optional[Tuple[Optional[str], str]] = None,
     ):
         super().__init__(
             dest_dir=dest_dir,
@@ -665,6 +701,8 @@ class ReprTracer(BaseTracer):
             only_main_thread=only_main_thread,
             skip_empty_thread=skip_empty_thread,
             only_main_process=only_main_process,
+            beg_func=beg_func,
+            end_func=end_func,
         )
 
         self._skip_copy_types = set(skip_copy_types) if skip_copy_types else set()
@@ -763,13 +801,14 @@ class ReprTracer(BaseTracer):
         if any(cls_full_name.startswith(p) for p in self._skip_copy_types):
             repr_str = self.repr(variable)
             return self.SnapShotVariable(cls, repr_str, self.serialize(repr_str))
+
         # normal
-        repr = self.repr(variable)
+        repr_str = self.repr(variable)
         try:
-            bytes = self.serialize(variable)
+            copy_bytes = self.serialize(variable)
         except:
-            bytes = self.serialize(repr)
-        return self.SnapShotVariable(cls, repr, bytes)
+            copy_bytes = self.serialize(repr_str)
+        return self.SnapShotVariable(cls, repr_str, copy_bytes)
 
     @override
     def _output_from_snapshot_variable(
@@ -807,27 +846,46 @@ class DebugTracer:
     def __init__(
         self,
         dest_dir: _StrOrPath,
+        dest_name: Optional[str] = None,
         includes: Optional[List[_StrOrPath]] = None,
         skip_copy_types: Optional[List[str]] = None,
         skip_repr_types: Optional[List[str]] = None,
+        beg_func: Optional[Tuple[Optional[str], str]] = None,
+        end_func: Optional[Tuple[Optional[str], str]] = None,
     ):
-        self.depth = 1
-
         self.dest_dir: Path = Path(dest_dir)
+        self._dest_name = dest_name or "types.json"
+
         self.includes = [str(p) for p in includes] if includes else []
 
         self._skip_copy_types = set(skip_copy_types) if skip_copy_types else set()
         self._skip_repr_types = set(skip_repr_types) if skip_repr_types else set()
 
         self._outputs = {
-            "skip_repr": [],
-            "skip_copy": [],
-            "remain": [],
+            "skip_repr": set(),
+            "skip_copy": set(),
+            "remain": set(),
         }
         self._lock = threading.Lock()
 
         self._serializer = Serializer(backend="pickle")
         self._representer = Representer()
+
+        # begin func
+        if beg_func:
+            self._beg_func_ok = False
+            self._beg_func_path, self._beg_func_name = beg_func
+        else:
+            self._beg_func_ok = True
+            self._beg_func_path, self._beg_func_name = (None, None)
+
+        # end func
+        if end_func:
+            self._end_func_ok = False
+            self._end_func_path, self._end_func_name = end_func
+        else:
+            self._end_func_ok = True
+            self._end_func_path, self._end_func_name = (None, None)
 
     def serialize(
         self,
@@ -850,11 +908,36 @@ class DebugTracer:
     def trace(self, frame: FrameType, event, arg):
 
         file_path = frame.f_code.co_filename
+        func_name = frame.f_code.co_name
+
+        # begin & end function check
+        if not self._beg_func_ok:
+            if event == "return" and self._beg_func_name == func_name:
+                if not self._beg_func_path or file_path == self._beg_func_path:
+                    self._beg_func_ok = True
+            else:
+                return self.trace
+
+        if not self._end_func_ok:
+            if event == "return" and self._end_func_name == func_name:
+                if not self._end_func_path or file_path == self._end_func_path:
+                    self._end_func_ok = True
+        else:
+            return self.trace
+        
+        # includes
         if not any(
             file_path.startswith(include_path) for include_path in self.includes
         ):
             return self.trace
-        for key, val in frame.f_locals.items():
+
+        if event == "call":
+            with self._lock:
+                print(
+                    f"TRACE CALL {frame.f_lineno} {frame.f_code.co_name} IN {frame.f_code.co_filename}"
+                )
+
+        for val in frame.f_locals.values():
 
             type_full_name = get_type_full_name(type(val))
 
@@ -862,14 +945,14 @@ class DebugTracer:
                 # test
                 self.serialize(base_repr(val))
                 with self._lock:
-                    self._outputs["skip_repr"].append(type_full_name)
+                    self._outputs["skip_repr"].add(type_full_name)
                 continue
 
             if any(type_full_name.startswith(p) for p in self._skip_copy_types):
                 # test
                 self.serialize(self.represent(val))
                 with self._lock:
-                    self._outputs["skip_copy"].append(type_full_name)
+                    self._outputs["skip_copy"].add(type_full_name)
                 continue
 
             if True:
@@ -881,7 +964,7 @@ class DebugTracer:
                     self.serialize(self.represent(val))
 
                 with self._lock:
-                    self._outputs["remain"].append(type_full_name)
+                    self._outputs["remain"].add(type_full_name)
                 continue
 
         return self.trace
@@ -896,16 +979,12 @@ class DebugTracer:
 
         self.dest_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(
-            Path(self.dest_dir)
-            / f"type_debugger__ppid-{os.getppid()}__pid-{os.getpid()}.json",
-            "w",
-        ) as f:
+        with open(Path(self.dest_dir) / self._dest_name, "w") as f:
             json.dump(
                 {
-                    "remain_types": sorted(list(self._remain_types)),
-                    "skip_types": sorted(list(self._skip_types)),
-                    "all_types": sorted(list(self._all_types)),
+                    "skip_repr": sorted(self._outputs["skip_repr"]),
+                    "skip_copy": sorted(self._outputs["skip_copy"]),
+                    "remain": sorted(self._outputs["remain"]),
                 },
                 f,
                 indent=4,
