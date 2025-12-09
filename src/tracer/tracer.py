@@ -17,6 +17,7 @@ from typing import (
     Optional,
     Dict,
     List,
+    Set,
     Tuple,
     Type,
     TypedDict,
@@ -32,8 +33,8 @@ from tracer.utils import (
     HookContext,
     Serializer,
     Representer,
-    base_repr,
-    get_type_full_name,
+    safe_repr,
+    get_full_qualified_name,
 )
 
 _StrOrPath = Union[str, Path]
@@ -104,8 +105,6 @@ class BaseTracer(ABC):
     def __init__(
         self,
         dest_dir: _StrOrPath,
-        includes: Optional[List[_StrOrPath]] = None,
-        excludes: Optional[List[_StrOrPath]] = None,
         trace_locals: bool = True,
         trace_globals: bool = False,
         only_trace_changed_locals: bool = True,
@@ -114,8 +113,15 @@ class BaseTracer(ABC):
         only_main_thread: bool = False,
         skip_empty_thread: bool = True,
         only_main_process: bool = False,
-        beg_func: Optional[Tuple[Optional[str], str]] = None,
-        end_func: Optional[Tuple[Optional[str], str]] = None,
+        *,
+        interval: Optional[
+            Tuple[
+                Optional[Tuple[Optional[str], str]], Optional[Tuple[Optional[str], str]]
+            ]
+        ] = None,
+        includes: Optional[List[_StrOrPath]] = None,
+        excludes: Optional[List[_StrOrPath]] = None,
+        targets: Optional[List[Tuple[str, str]]] = None,
     ):
         kwds = locals()
         kwds.pop("self")
@@ -127,45 +133,136 @@ class BaseTracer(ABC):
         if self._dest_dir.exists() and not self._dest_dir.is_dir():
             raise ValueError(f"Destination {dest_dir} is not a directory.")
 
-        self._includes = [str(p) for p in includes] if includes else None
-        self._excludes = [str(p) for p in excludes] if excludes else None
-
+        # basic
         self._trace_locals = trace_locals
         self._trace_globals = trace_globals
         self._only_trace_changed_locals = only_trace_changed_locals
         self._only_trace_changed_globals = only_trace_changed_globals
         self._skip_empty_trace = skip_empty_trace
 
-        # trace thread
+        # thread
         self._only_main_thread = only_main_thread
         self._skip_empty_thread = skip_empty_thread
-        # self._thread_contexts: Dict[threading.Thread, TracerThreadContext] = {}
-
         self._thread_lock = threading.Lock()
         self._thread_local = threading.local()
         self._thread_contexts: List[TracerThreadContext] = []
 
-        # trace process
+        # process
         self._only_main_process = only_main_process
-
-        # hook
         self._hook_context: HookContext = HookContext()
 
-        # begin func
-        if beg_func:
-            self._beg_func_ok = False
-            self._beg_func_path, self._beg_func_name = beg_func
-        else:
-            self._beg_func_ok = True
-            self._beg_func_path, self._beg_func_name = (None, None)
+        # features
 
-        # end func
-        if end_func:
-            self._end_func_ok = False
-            self._end_func_path, self._end_func_name = end_func
+        # interval
+        if interval is not None:
+            beg, end = interval
+            if beg is None:
+                (
+                    self._interval_beg,
+                    self._interval_beg_ok,
+                ) = (None, None)
+            else:
+                (
+                    self._interval_beg,
+                    self._interval_beg_ok,
+                ) = (beg, False)
+            if end is None:
+                (
+                    self._interval_end,
+                    self._interval_end_ok,
+                ) = (None, None)
+            else:
+                (
+                    self._interval_end,
+                    self._interval_end_ok,
+                ) = (end, False)
         else:
-            self._end_func_ok = True
-            self._end_func_path, self._end_func_name = (None, None)
+            (
+                self._interval_beg,
+                self._interval_beg_ok,
+            ) = (None, None)
+            (
+                self._interval_end,
+                self._interval_end_ok,
+            ) = (None, None)
+
+        # includes or excludes
+        self._includes = [str(p) for p in includes] if includes else None
+        self._excludes = [str(p) for p in excludes] if excludes else None
+
+        # targets
+        self._targets: Set[Tuple[str, str, int]] = (
+            set(targets) if targets is not None else None
+        )
+
+    def _check_includes_or_excludes(
+        self,
+        file_path: str,
+    ) -> bool:
+        if self._includes is not None:
+            if not any(file_path.startswith(pattern) for pattern in self._includes):
+                return False
+        if self._excludes is not None:
+            if any(file_path.startswith(pattern) for pattern in self._excludes):
+                return False
+        return True
+
+    def _check_interval(
+        self,
+        event: str,
+        file_path: str,
+        func_name: str,
+    ) -> bool:
+        if self._interval_beg:
+            if self._interval_beg_ok:
+                return True
+            beg_path, beg_func = self._interval_beg
+            if event == "return" and beg_func == func_name:
+                if not beg_path or file_path == beg_path:
+                    self._interval_beg_ok = True
+            else:
+                return False
+        if self._interval_end:
+            if self._interval_end_ok:
+                return False
+            end_path, end_func = self._interval_end
+            if event == "call" and end_func == func_name:
+                if not end_path or file_path == end_path:
+                    self._interval_end_ok = True
+                    return False
+            else:
+                return True
+        return True
+
+    def _check_targets(
+        self,
+        event: str,
+        file_path: str,
+        func_name: str,
+    ) -> bool:
+        if self._targets:
+            targets: Dict = self._store("targets")
+            target = (file_path, func_name)
+            # track function call
+            if event == "call":
+                if target in self._targets:
+                    if target in targets:
+                        targets[target] += 1
+                    else:
+                        targets[target] = 1
+            try:
+                if not targets:
+                    return False
+            finally:
+                # track function return
+                if event == "return":
+                    if target in self._targets:
+                        if target in targets:
+                            if targets[target] > 1:
+                                targets[target] -= 1
+                            else:
+                                del targets[target]
+        return True
 
     def trace(
         self,
@@ -173,60 +270,33 @@ class BaseTracer(ABC):
         event: str,
         arg: Any,
     ) -> Optional[Callable[[FrameType, str, Any], Any]]:
-        
+
         # update depth
         if event == "call":
-            self._current_thread_depth_set(self._current_thread_depth_get() + 1)
-
+            self._depth_set(self._depth_get() + 1)
         elif event == "return":
-            self._current_thread_depth_set(self._current_thread_depth_get() - 1)
+            self._depth_set(self._depth_get() - 1)
 
         file_path = frame.f_code.co_filename
         func_name = frame.f_code.co_name
+        func_line = frame.f_lineno
 
-        # begin & end function check
-        if not self._beg_func_ok:
-            if event == "return" and self._beg_func_name == func_name:
-                if not self._beg_func_path or file_path == self._beg_func_path:
-                    self._beg_func_ok = True
-            else:
-                return self.trace
-
-        if not self._end_func_ok:
-            if event == "return" and self._end_func_name == func_name:
-                if not self._end_func_path or file_path == self._end_func_path:
-                    self._end_func_ok = True
-        else:
+        if not self._check_interval(event, file_path, func_name):
             return self.trace
 
-        # check patterns
-        if self._includes is not None:
-            if not any(
-                frame.f_code.co_filename.startswith(pattern)
-                for pattern in self._includes
-            ):
-                return self.trace
-        if self._excludes is not None:
-            if any(
-                frame.f_code.co_filename.startswith(pattern)
-                for pattern in self._excludes
-            ):
-                return self.trace
+        if not self._check_includes_or_excludes(file_path):
+            return self.trace
 
-        # if event == "call" and True:
-        #     print(
-        #         f"TRACE CALL [{self._current_thread_depth_get()}] {frame.f_lineno} {frame.f_code.co_name} IN {frame.f_code.co_filename} TIME {time.time()}",
-        #         flush=False,
-        #     )  # DEBUG
+        if not self._check_targets(event, file_path, func_name):
+            return self.trace
 
         if event == "call":
             locals = self._snapshot_variables(frame.f_locals)
-
             # create function trace
             function: FunctionDict = {
-                "file": frame.f_code.co_filename,
-                "depth": self._current_thread_depth_get(),
-                "name": frame.f_code.co_name,
+                "file": file_path,
+                "depth": self._depth_get(),
+                "name": func_name,
                 "params": self._output_from_snapshot_variables(locals),
                 "traces": [],
                 "retval": None,
@@ -243,18 +313,18 @@ class BaseTracer(ABC):
                 function["globals"] = self._output_from_snapshot_variables(globals)
 
             # push function
-            self._current_thread_stack().append(function)
+            self._stack().append(function)
 
         elif event == "return":
 
             # pop function
-            function = self._current_thread_stack().pop()
+            function = self._stack().pop()
             function["retval"] = self._output_from_snapshot_variable(
                 self._snapshot_variable(arg)
             )
 
             # ensure trace available
-            self._current_thread_ensure_caller_legal(
+            self._caller_fix(
                 frame=frame.f_back,
             )
 
@@ -267,12 +337,12 @@ class BaseTracer(ABC):
                     del function["__global_snapshot__"]
 
             # write function
-            self._current_thread_caller()["traces"][-1]["functions"].append(function)
+            self._caller()["traces"][-1]["functions"].append(function)
 
         elif event == "line":
 
             trace = {
-                "line": frame.f_lineno,
+                "line": func_line,
                 "functions": [],
                 "exceptions": [],
             }
@@ -282,10 +352,10 @@ class BaseTracer(ABC):
                 locals = self._snapshot_variables(frame.f_locals)
                 if self._only_trace_changed_locals:
                     locals = self._diff_snapshot_variables(
-                        self._current_thread_caller()["__local_snapshot__"],
+                        self._caller()["__local_snapshot__"],
                         locals,
                     )
-                    self._current_thread_caller()["__local_snapshot__"].update(locals)
+                    self._caller()["__local_snapshot__"].update(locals)
                 trace["locals"] = self._output_from_snapshot_variables(locals)
 
             # make trace globales
@@ -293,26 +363,26 @@ class BaseTracer(ABC):
                 globals = self._snapshot_variables(frame.f_globals)
                 if self._only_trace_changed_globals:
                     globals = self._diff_snapshot_variables(
-                        self._current_thread_caller()["__global_snapshot__"],
+                        self._caller()["__global_snapshot__"],
                         globals,
                     )
-                    self._current_thread_caller()["__global_snapshot__"].update(globals)
+                    self._caller()["__global_snapshot__"].update(globals)
                 trace["globals"] = self._output_from_snapshot_variables(globals)
 
             # append trace
             if not self._skip_empty_trace or not self._is_function_trace_empty(trace):
-                self._current_thread_caller()["traces"].append(trace)
+                self._caller()["traces"].append(trace)
 
         elif event == "exception":
             # ensure trace available
-            self._current_thread_ensure_caller_legal(
+            self._caller_fix(
                 frame=frame,
             )
 
             exc_type, exc_value, exc_traceback = arg
-            self._current_thread_caller()["traces"][-1]["exceptions"].append(
+            self._caller()["traces"][-1]["exceptions"].append(
                 {
-                    "function": frame.f_code.co_name,
+                    "function": func_name,
                     "type": self._output_by_exc_type(exc_type),
                     "value": self._output_by_exc_val(exc_value),
                     "traceback": self._output_by_exc_traceback(exc_traceback),
@@ -321,7 +391,23 @@ class BaseTracer(ABC):
 
         return self.trace
 
-    def _current_thread_context(
+    def _store(
+        self,
+        key: str,
+    ) -> Dict:
+        try:
+            store = getattr(self._thread_local, "store")
+        except AttributeError:
+            store = {}
+            setattr(self._thread_local, "store", store)
+        try:
+            value = store[key]
+        except KeyError:
+            value = {}
+            store[key] = value
+        return value
+
+    def _context(
         self,
     ) -> TracerThreadContext:
         if hasattr(self._thread_local, "context"):
@@ -332,32 +418,32 @@ class BaseTracer(ABC):
             self._thread_contexts.append(thread_context)
         return thread_context
 
-    def _current_thread_depth_get(
+    def _depth_get(
         self,
     ) -> int:
-        return self._current_thread_context()._depth
+        return self._context()._depth
 
-    def _current_thread_depth_set(
+    def _depth_set(
         self,
         depth: int,
     ) -> None:
-        self._current_thread_context()._depth = depth
+        self._context()._depth = depth
 
-    def _current_thread_stack(
+    def _stack(
         self,
     ) -> List[FunctionDict]:
-        return self._current_thread_context()._stacks
+        return self._context()._stacks
 
-    def _current_thread_caller(
+    def _caller(
         self,
     ) -> FunctionDict:
-        return self._current_thread_stack()[-1]
+        return self._stack()[-1]
 
-    def _current_thread_ensure_caller_legal(
+    def _caller_fix(
         self,
         frame: FrameType,
     ) -> None:
-        if self._current_thread_caller()["traces"]:
+        if self._caller()["traces"]:
             return
 
         trace = {
@@ -370,22 +456,22 @@ class BaseTracer(ABC):
             locals = self._snapshot_variables(frame.f_locals)
             if self._only_trace_changed_locals:
                 locals = self._diff_snapshot_variables(
-                    self._current_thread_caller()["__local_snapshot__"], locals
+                    self._caller()["__local_snapshot__"], locals
                 )
-                self._current_thread_caller()["__local_snapshot__"].update(locals)
+                self._caller()["__local_snapshot__"].update(locals)
             trace["locals"] = self._output_from_snapshot_variables(locals)
 
         if self._trace_globals:
             globals = self._snapshot_variables(frame.f_globals)
             if self._only_trace_changed_globals:
                 globals = self._diff_snapshot_variables(
-                    self._current_thread_caller()["__global_snapshot__"],
+                    self._caller()["__global_snapshot__"],
                     globals,
                 )
-                self._current_thread_caller()["__global_snapshot__"].update(globals)
+                self._caller()["__global_snapshot__"].update(globals)
             trace["globals"] = self._output_from_snapshot_variables(globals)
 
-        self._current_thread_caller()["traces"].append(trace)
+        self._caller()["traces"].append(trace)
 
     def _is_function_trace_empty(
         self,
@@ -498,7 +584,7 @@ class BaseTracer(ABC):
             pass
 
         try:
-            import multiprocess.process
+            import multiprocess.process  # type: ignore
 
             self._hook_context.hook(
                 obj=multiprocess.process.BaseProcess,
@@ -528,6 +614,9 @@ class BaseTracer(ABC):
                     / f"tracer__ppid-{os.getppid()}__pid-{os.getpid()}__thread-{thread_name}.json",
                     "w",
                 ) as f:
+                    # import jsonpickle
+
+                    # f.write(jsonpickle.encode(trace, unpicklable=False, indent=4))
                     json.dump(trace, f, indent=4)
 
     def start(
@@ -600,8 +689,8 @@ class BaseTracer(ABC):
                     )
 
                 thread_context._stacks[-1]["traces"][-1]["functions"].append(function)
-            # repair broken stacks end
 
+            # repair broken stacks end
             value = thread_context._stacks[0]["traces"][0]["functions"]
 
             if self._skip_empty_thread and not value:
@@ -673,8 +762,6 @@ class ReprTracer(BaseTracer):
     def __init__(
         self,
         dest_dir: _StrOrPath,
-        includes: Optional[List[_StrOrPath]] = None,
-        excludes: Optional[List[_StrOrPath]] = None,
         trace_locals: bool = True,
         trace_globals: bool = False,
         only_trace_changed_locals: bool = True,
@@ -686,13 +773,18 @@ class ReprTracer(BaseTracer):
         serializer_backend: Literal["pickle", "dill"] = "pickle",
         skip_repr_types: Optional[List[str]] = None,
         skip_copy_types: Optional[List[str]] = None,
-        beg_func: Optional[Tuple[Optional[str], str]] = None,
-        end_func: Optional[Tuple[Optional[str], str]] = None,
+        *,
+        interval: Optional[
+            Tuple[
+                Optional[Tuple[Optional[str], str]], Optional[Tuple[Optional[str], str]]
+            ]
+        ] = None,
+        includes: Optional[List[_StrOrPath]] = None,
+        excludes: Optional[List[_StrOrPath]] = None,
+        targets: Optional[List[Tuple[str, str, int]]] = None,
     ):
         super().__init__(
             dest_dir=dest_dir,
-            includes=includes,
-            excludes=excludes,
             trace_locals=trace_locals,
             trace_globals=trace_globals,
             only_trace_changed_locals=only_trace_changed_locals,
@@ -701,8 +793,10 @@ class ReprTracer(BaseTracer):
             only_main_thread=only_main_thread,
             skip_empty_thread=skip_empty_thread,
             only_main_process=only_main_process,
-            beg_func=beg_func,
-            end_func=end_func,
+            interval=interval,
+            includes=includes,
+            excludes=excludes,
+            targets=targets,
         )
 
         self._skip_copy_types = set(skip_copy_types) if skip_copy_types else set()
@@ -755,7 +849,10 @@ class ReprTracer(BaseTracer):
         self,
         var: Any,
     ) -> str:
-        return self.representer().repr(var)
+        return self.representer().repr(
+            var,
+            skip_types=self._skip_repr_types,
+        )
 
     def serialize(
         self,
@@ -790,11 +887,11 @@ class ReprTracer(BaseTracer):
     ) -> SnapShotVariable:
 
         cls = type(variable)
-        cls_full_name = get_type_full_name(cls)
+        cls_full_name = get_full_qualified_name(variable)
 
         # skip repr
         if any(cls_full_name.startswith(p) for p in self._skip_repr_types):
-            repr_str = base_repr(variable)
+            repr_str = safe_repr(variable)
             return self.SnapShotVariable(cls, repr_str, self.serialize(repr_str))
 
         # skip copy
@@ -841,25 +938,35 @@ class ReprTracer(BaseTracer):
 Tracer = ReprTracer
 
 
-class DebugTracer:
+class DebugTracer(BaseTracer):
 
     def __init__(
         self,
         dest_dir: _StrOrPath,
         dest_name: Optional[str] = None,
-        includes: Optional[List[_StrOrPath]] = None,
         skip_copy_types: Optional[List[str]] = None,
         skip_repr_types: Optional[List[str]] = None,
-        beg_func: Optional[Tuple[Optional[str], str]] = None,
-        end_func: Optional[Tuple[Optional[str], str]] = None,
+        only_main_thread: bool = False,
+        *,
+        interval: Optional[
+            Tuple[
+                Optional[Tuple[Optional[str], str]], Optional[Tuple[Optional[str], str]]
+            ]
+        ] = None,
+        includes: Optional[List[_StrOrPath]] = None,
+        excludes: Optional[List[_StrOrPath]] = None,
+        targets: Optional[List[Tuple[str, str]]] = None,
     ):
         self.dest_dir: Path = Path(dest_dir)
         self._dest_name = dest_name or "types.json"
 
-        self.includes = [str(p) for p in includes] if includes else []
+        self._serializer = Serializer(backend="pickle")
+        self._representer = Representer()
 
         self._skip_copy_types = set(skip_copy_types) if skip_copy_types else set()
         self._skip_repr_types = set(skip_repr_types) if skip_repr_types else set()
+
+        self._only_main_thread = only_main_thread
 
         self._outputs = {
             "skip_repr": set(),
@@ -868,24 +975,48 @@ class DebugTracer:
         }
         self._lock = threading.Lock()
 
-        self._serializer = Serializer(backend="pickle")
-        self._representer = Representer()
+        self._thread_local = threading.local()
 
-        # begin func
-        if beg_func:
-            self._beg_func_ok = False
-            self._beg_func_path, self._beg_func_name = beg_func
-        else:
-            self._beg_func_ok = True
-            self._beg_func_path, self._beg_func_name = (None, None)
+        # features
 
-        # end func
-        if end_func:
-            self._end_func_ok = False
-            self._end_func_path, self._end_func_name = end_func
+        # interval
+        if interval is not None:
+            beg, end = interval
+            if beg is None:
+                (
+                    self._interval_beg,
+                    self._interval_beg_ok,
+                ) = (None, None)
+            else:
+                (
+                    self._interval_beg,
+                    self._interval_beg_ok,
+                ) = (beg, False)
+            if end is None:
+                (
+                    self._interval_end,
+                    self._interval_end_ok,
+                ) = (None, None)
+            else:
+                (
+                    self._interval_end,
+                    self._interval_end_ok,
+                ) = (end, False)
         else:
-            self._end_func_ok = True
-            self._end_func_path, self._end_func_name = (None, None)
+            (
+                self._interval_beg,
+                self._interval_beg_ok,
+            ) = (None, None)
+            (
+                self._interval_end,
+                self._interval_end_ok,
+            ) = (None, None)
+
+        # includes or excludes
+        self._includes = [str(p) for p in includes] if includes else []
+        self._excludes = [str(p) for p in excludes] if excludes else []
+
+        self._targets: Set[Tuple[str, str, int]] = set(targets) if targets else None
 
     def serialize(
         self,
@@ -897,53 +1028,57 @@ class DebugTracer:
         self,
         val: Any,
     ) -> str:
-        return self._representer.repr(val)
+        return self._representer.repr(
+            val,
+            skip_types=self._skip_repr_types,
+        )
 
     def __enter__(
         self,
     ):
-        threading.settrace_all_threads(self.trace)
+        if not self._only_main_thread:
+            threading.settrace_all_threads(self.trace)
+        else:
+            sys.settrace(self.trace)
         return self
 
-    def trace(self, frame: FrameType, event, arg):
+    def trace(
+        self,
+        frame: FrameType,
+        event: str,
+        arg: Any,
+    ):
 
         file_path = frame.f_code.co_filename
         func_name = frame.f_code.co_name
+        func_line = frame.f_lineno
 
-        # begin & end function check
-        if not self._beg_func_ok:
-            if event == "return" and self._beg_func_name == func_name:
-                if not self._beg_func_path or file_path == self._beg_func_path:
-                    self._beg_func_ok = True
-            else:
-                return self.trace
+        if not self._check_interval(event, file_path, func_name):
+            return self.trace
 
-        if not self._end_func_ok:
-            if event == "return" and self._end_func_name == func_name:
-                if not self._end_func_path or file_path == self._end_func_path:
-                    self._end_func_ok = True
-        else:
+        if not self._check_targets(event, file_path, func_name):
             return self.trace
-        
-        # includes
-        if not any(
-            file_path.startswith(include_path) for include_path in self.includes
-        ):
+
+        if not self._check_includes_or_excludes(file_path):
             return self.trace
+
+        # if event == "call":
+        #     print(func_name,file_path,func_line)
 
         if event == "call":
-            with self._lock:
-                print(
-                    f"TRACE CALL {frame.f_lineno} {frame.f_code.co_name} IN {frame.f_code.co_filename}"
-                )
+            print(
+                f"TRACE CALL {frame.f_lineno} {frame.f_code.co_name} IN {frame.f_code.co_filename}"
+            )
 
         for val in frame.f_locals.values():
 
-            type_full_name = get_type_full_name(type(val))
+            type_full_name = get_full_qualified_name(val)
+
+            # print(type_full_name)
 
             if any(type_full_name.startswith(p) for p in self._skip_repr_types):
                 # test
-                self.serialize(base_repr(val))
+                self.serialize(safe_repr(val))
                 with self._lock:
                     self._outputs["skip_repr"].add(type_full_name)
                 continue
@@ -975,7 +1110,10 @@ class DebugTracer:
         exc_value,
         traceback,
     ):
-        threading.settrace_all_threads(None)
+        if not self._only_main_thread:
+            threading.settrace_all_threads(None)
+        else:
+            sys.settrace(None)
 
         self.dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -989,3 +1127,24 @@ class DebugTracer:
                 f,
                 indent=4,
             )
+
+    @override
+    def _compare_snapshot_variable(self, v1, v2): ...
+
+    @override
+    def _diff_snapshot_variables(self, snapshot, variables): ...
+
+    @override
+    def _output_from_snapshot_variable(self, variable): ...
+
+    @override
+    def _output_by_exc_traceback(self, exception_traceback: TracebackType) -> str: ...
+
+    @override
+    def _output_by_exc_type(self, exception_type: Type[BaseException]) -> str: ...
+
+    @override
+    def _output_by_exc_val(self, exception_value: BaseException) -> str: ...
+
+    @override
+    def _snapshot_variable(self, variable): ...

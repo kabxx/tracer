@@ -33,8 +33,8 @@ from tracer.utils import (
     deep_equal,
     deep_copy,
     V1RegisterRepresenter,
-    safe_repr,
-    SafeRichRegistryRepresenter,
+    no_raise_repr,
+    NoRaiseRichRegistryRepresenter,
     SerializableReprWrapperClass,
     HookContext,
 )
@@ -921,28 +921,28 @@ class _V1ReprTracer(BaseTracer):
         self,
         variable: Any,
     ) -> Any:
-        return safe_repr(variable)
+        return no_raise_repr(variable)
 
     @override
     def _serialize_function_return_value(
         self,
         function_return_value: Any,
     ) -> str:
-        return safe_repr(function_return_value)
+        return no_raise_repr(function_return_value)
 
     @override
     def _serialize_exception_type(
         self,
         exception_type: Type[BaseException],
     ) -> Any:
-        return safe_repr(exception_type)
+        return no_raise_repr(exception_type)
 
     @override
     def _serialize_exception_value(
         self,
         exception_value: BaseException,
     ) -> Any:
-        return safe_repr(exception_value)
+        return no_raise_repr(exception_value)
 
     @override
     def _serialize_exception_traceback(
@@ -967,7 +967,7 @@ class _V1ReprTracer(BaseTracer):
         try:
             return deep_copy(variable)
         except:
-            return safe_repr(variable)
+            return no_raise_repr(variable)
 
     @override
     def _diff_variables(
@@ -1011,7 +1011,7 @@ class _V2ReprTracer(BaseTracer):
             only_main_process=only_main_process,
         )
 
-        self._helper = SafeRichRegistryRepresenter()
+        self._helper = NoRaiseRichRegistryRepresenter()
 
     def helper(
         self,
@@ -1123,7 +1123,7 @@ class _V3ReprTracer(BaseTracer):
             only_main_process=only_main_process,
         )
 
-        self._helper = SafeRichRegistryRepresenter()
+        self._helper = NoRaiseRichRegistryRepresenter()
 
     def repr(
         self,
